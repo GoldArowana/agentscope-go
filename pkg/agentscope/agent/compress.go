@@ -68,7 +68,7 @@ const defaultSummaryTemplate = "<system-info>Here is a summary of your previous 
 type ContextConfig struct {
 	TriggerRatio      float64         // Token ratio to trigger compression (default 0.8, max 0.9).
 	ReserveRatio      float64         // Ratio of tokens to keep as recent context (default 0.1).
-	ContextSize       int             // Override context window size (0 = auto-detect from model).
+	ContextSize       int             // Override context window size (<= 0 = auto-detect from model).
 	CompressionPrompt string          // Prompt guiding the model to generate a summary.
 	SummaryTemplate   string          // Template with {field} placeholders for the structured summary.
 	SummarySchema     json.RawMessage // JSON Schema for structured output (matches SummarySchema fields).
@@ -202,7 +202,7 @@ func (a *UnifiedAgent) compressContextForTool(ctx context.Context) (tool.Compres
 
 func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConfig) error {
 	ctxSize := cfg.ContextSize
-	if ctxSize == 0 {
+	if ctxSize <= 0 {
 		ctxSize = model.ResolveContextSize(a.model, defaultContextSize)
 	}
 

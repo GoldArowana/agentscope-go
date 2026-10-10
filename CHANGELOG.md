@@ -32,6 +32,11 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ### Fixed
 
+- Nonpositive `agent.ContextConfig.ContextSize` values use the existing
+  model/default context-window resolution. Negative overrides previously
+  triggered unnecessary compression and could discard all retained history,
+  including when summary generation failed. Positive overrides and zero-value
+  automatic detection retain their existing behavior.
 - Skill frontmatter parsing recognizes closing `---` only on an unindented
   delimiter line, preserving inline hyphens and YAML block-scalar content so
   added skills remain discoverable and removable.
