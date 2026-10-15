@@ -126,6 +126,8 @@ type UnifiedAgent struct {
 	// resumed reply simply regenerates.
 	precompressRunning bool
 	pendingPrecompress *precompressResult
+
+	toolConcurrencyLimit int
 }
 
 // ReactConfig controls the ReAct reasoning-acting loop.
@@ -332,6 +334,8 @@ func WithResponseFormat(rf *model.ResponseFormat) AgentOption {
 // It panics if name is empty or model is nil: both are programmer errors that
 // would otherwise surface as an obscure nil-dereference deep inside the reply
 // loop. (This mirrors message.NewMsg, which also panics on invalid construction.)
+// Options can reject invalid configuration during construction; explicitly
+// configured WithToolConcurrencyLimit widths must be positive.
 func NewUnifiedAgent(name, systemPrompt string, m model.ChatModel, opts ...AgentOption) *UnifiedAgent {
 	if name == "" {
 		panic("agent: NewUnifiedAgent requires a non-empty name")
@@ -841,22 +845,26 @@ reactLoop:
 		case protocol.StateAct:
 			// Execute pending tool calls from prior iteration
 			toolCalls := a.getExecutableToolCalls()
-			a.recordToolCalls(len(toolCalls))
-			batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
-			for _, batch := range batches {
-				if batch.concurrent && len(batch.calls) > 1 {
-					for _, tc := range batch.calls {
-						hooks.BeforeToolExec(curState, iter, tc.Name)
-					}
-					a.executeConcurrentBatch(ctx, ch, replyID, batch.calls, actingHandler)
-					for _, tc := range batch.calls {
-						hooks.AfterToolExec(curState, iter, tc.Name, nil)
-					}
-				} else {
-					for _, tc := range batch.calls {
-						hooks.BeforeToolExec(curState, iter, tc.Name)
-						a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
-						hooks.AfterToolExec(curState, iter, tc.Name, nil)
+			if a.toolConcurrencyLimit > 0 {
+				a.executeBoundedToolStep(ctx, ch, replyID, toolCalls, actingHandler, hooks, curState, iter)
+			} else {
+				a.recordToolCalls(len(toolCalls))
+				batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
+				for _, batch := range batches {
+					if batch.concurrent && len(batch.calls) > 1 {
+						for _, tc := range batch.calls {
+							hooks.BeforeToolExec(curState, iter, tc.Name)
+						}
+						a.executeConcurrentBatch(ctx, ch, replyID, batch.calls, actingHandler)
+						for _, tc := range batch.calls {
+							hooks.AfterToolExec(curState, iter, tc.Name, nil)
+						}
+					} else {
+						for _, tc := range batch.calls {
+							hooks.BeforeToolExec(curState, iter, tc.Name)
+							a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
+							hooks.AfterToolExec(curState, iter, tc.Name, nil)
+						}
 					}
 				}
 			}
@@ -869,6 +877,9 @@ reactLoop:
 			}
 			if err := a.checkpointBoundary(ctx); err != nil {
 				return types.ReplyError, madeProgress, checkpointError(err)
+			}
+			if a.toolConcurrencyLimit > 0 && ctx.Err() != nil {
+				return types.ReplyInterrupted, madeProgress, nil
 			}
 			// Transition back to Reason after acting
 			hooks.OnStateTransition(curState, protocol.StateReason, iter)
@@ -1024,22 +1035,26 @@ reactLoop:
 			curState = protocol.StateAct
 
 			// Execute tool calls
-			a.recordToolCalls(len(toolCalls))
-			batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
-			for _, batch := range batches {
-				if batch.concurrent && len(batch.calls) > 1 {
-					for _, tc := range batch.calls {
-						hooks.BeforeToolExec(curState, iter, tc.Name)
-					}
-					a.executeConcurrentBatch(ctx, ch, replyID, batch.calls, actingHandler)
-					for _, tc := range batch.calls {
-						hooks.AfterToolExec(curState, iter, tc.Name, nil)
-					}
-				} else {
-					for _, tc := range batch.calls {
-						hooks.BeforeToolExec(curState, iter, tc.Name)
-						a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
-						hooks.AfterToolExec(curState, iter, tc.Name, nil)
+			if a.toolConcurrencyLimit > 0 {
+				a.executeBoundedToolStep(ctx, ch, replyID, toolCalls, actingHandler, hooks, curState, iter)
+			} else {
+				a.recordToolCalls(len(toolCalls))
+				batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
+				for _, batch := range batches {
+					if batch.concurrent && len(batch.calls) > 1 {
+						for _, tc := range batch.calls {
+							hooks.BeforeToolExec(curState, iter, tc.Name)
+						}
+						a.executeConcurrentBatch(ctx, ch, replyID, batch.calls, actingHandler)
+						for _, tc := range batch.calls {
+							hooks.AfterToolExec(curState, iter, tc.Name, nil)
+						}
+					} else {
+						for _, tc := range batch.calls {
+							hooks.BeforeToolExec(curState, iter, tc.Name)
+							a.executeAndRecord(ctx, ch, replyID, &tc, actingHandler)
+							hooks.AfterToolExec(curState, iter, tc.Name, nil)
+						}
 					}
 				}
 			}
@@ -1050,6 +1065,9 @@ reactLoop:
 			}
 			if err := a.checkpointBoundary(ctx); err != nil {
 				return types.ReplyError, madeProgress, checkpointError(err)
+			}
+			if a.toolConcurrencyLimit > 0 && ctx.Err() != nil {
+				return types.ReplyInterrupted, madeProgress, nil
 			}
 			// After acting, transition back to Reason
 			hooks.OnStateTransition(curState, protocol.StateReason, iter)
@@ -1981,6 +1999,10 @@ func (a *UnifiedAgent) executeConcurrentBatch(
 	}
 	wg.Wait()
 
+	a.recordConcurrentResults(ctx, ch, replyID, calls, results)
+}
+
+func (a *UnifiedAgent) recordConcurrentResults(ctx context.Context, ch chan<- event.Event, replyID string, calls []message.ToolCallBlock, results []toolResult) {
 	// Emit events and merge results into context in original order
 	for i, tc := range calls {
 		start := event.NewToolCallStartEvent(replyID, tc.ID, tc.Name)
