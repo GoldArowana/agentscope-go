@@ -13,6 +13,13 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ### Added
 
+- Experimental `classifier/bailian` for Alibaba Cloud Model Studio System One:
+  typed Binary/Choice/Score decisions, Bailian-specific limits, guarded single
+  HTTP attempts and unknown-usage preservation. Shares an internal wire codec
+  with Jev, retaining Jev's existing API and limits. Includes offline fixtures,
+  executable examples and an opt-in live check; see the [guide](docs/bailian.md)
+  (#69, #16).
+
 - `mcp/streamablehttp` provides a Streamable HTTP client for MCP (#55, #63),
   backed by the official `modelcontextprotocol/go-sdk` (pinned v1.8.0) — the
   repository's first protocol-class dependency. It implements the existing

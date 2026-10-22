@@ -233,6 +233,7 @@ enlaces al mismo catálogo.
 | Middleware y memoria | [Middleware](docs/middleware.md) |
 | Despliegue de aplicaciones | [Despliegue](docs/deployment.md) · [Límites de ejecución y sesiones](docs/adversarial-hardening.md) |
 | Tareas de texto controladas | [Ejecución fija](docs/managed-task.md) · [Enrutamiento](docs/managed-routing.md) · [Evaluación](docs/managed-routing-evaluation.md) |
+| Clasificación probabilística | [Contratos y registro de intentos](docs/classifier.md) · [Adaptador Bailian](docs/bailian.md) |
 | Runtime y evaluación | [Funciones del runtime](docs/go-exclusive.md) · [Pruebas de carga](docs/benchmarks.md) · [Código de replay y evaluación](pkg/agentscope/replay/) |
 | Modelos locales y dispositivos | [Despliegue edge](docs/edge-deployment.md) · [Herramientas de dispositivos](docs/device-tools.md) · [Coordinación entre dispositivos](docs/multi-device.md) · [Funcionamiento sin conexión](docs/offline-operation.md) |
 | Implementación y compatibilidad | [Mapa del código](CLAUDE.md) · [Estabilidad de API](STABILITY.md) · [Historial de cambios](CHANGELOG.md) |
