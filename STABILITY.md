@@ -99,6 +99,19 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   oversized/no-prefix cases keep the wholesale emergency fallback. See the
   [compaction policy and provider limits](docs/context-compaction.md).
 
+- `agent.Conversation` (`UnifiedAgent.NewConversation`) is Experimental despite
+  its placement in the Stable-tier `agent` package. It adds a persistent turn
+  kernel — queued input, mid-turn steering, Interrupt and queued compaction —
+  on top of the one-shot reply API. While a conversation is active, direct
+  `Reply`/`ReplyStream`/`ResumeReplyStream` calls are rejected; `Close`
+  releases the agent. Per-turn reply semantics and event contracts are
+  unchanged; the conversation operation and event vocabulary may still evolve.
+
+- `tool.ShellManager` and the `Shell`/`ShellStdin` tools are Experimental.
+  They add persistent shell sessions (POSIX only) with cross-call state,
+  stdin interaction and head/tail-bounded output. The tool names, session
+  semantics and result schema may still evolve.
+
 - `managedtask.Executor` is a separate fixed-deployment, plain-text, non-streaming,
   tool-disabled boundary with host disclosure/qualification, trustworthy context
   bounds, finite local admission/retries and frozen terminal accounting. Unknown
@@ -591,6 +604,19 @@ explicitly configured `OllamaConfig.ContextSize`. Wiring this means adding
 `ModelName()` to those eight first. For `OllamaChatModel`, that would also let
 `ResolveContextSize` report a card's maximum for an undeclared window, which is
 not the server's `num_ctx`.
+
+## Codex-alignment non-goals
+
+The codex-parity work (conversation kernel, persistent shell, permission
+hardening, plan/context tools, elicitation, pre-compression) deliberately
+stops at three codex mechanisms. These are policy statements, not pending
+work; revisit only with a concrete portability or contract argument.
+
+| Codex mechanism | Why agentscope-go does not adopt it |
+|---|---|
+| OS-level command sandbox (seatbelt/Landlock) | A library cannot confine its host process, and per-process syscall policy is a deployment concern. Isolation lives at the layers a library can own: the permission engine gates every tool call (conjunctive subcommand matching, persistent learned rules), `LocalWorkspace`/`BubblewrapWorkspace` provide path jails and container-grade isolation, and MCP subprocesses start with a minimal environment. Hosts needing kernel confinement should run the agent process itself inside a container or seatbelt wrapper. |
+| Guardian (secondary-model action review) | A fixed guardian policy would hard-code model, prompt and UX choices that hosts legitimately differ on. The interception point already exists: a host middleware implementing `OnActing`/`OnCheckPermission` can route any tool call through its own reviewer model before returning a decision. |
+| Blocking config-time hooks | Constructors are pure and panic only on programmer error (see "Construction contract"); `LoadProjectConfig` reads project instruction and settings files without executing anything. Running host commands at construction or config load would invert that contract and put unobservable side effects outside the permission engine. Lifecycle interception belongs to middleware, which runs inside the reply loop with event visibility. |
 
 ## Open hardening work
 

@@ -25,3 +25,21 @@ type Checker interface {
 	// avoid future confirmations for similar tool invocations.
 	GenerateSuggestions(input map[string]any) []Rule
 }
+
+// CompoundRuleMatcher is an optional Checker extension for tools whose input
+// can carry compound operations (e.g. shell commands joined with &&, pipes or
+// command substitutions). The engine consults it with the whole rule set for
+// the tool instead of one rule at a time:
+//
+//   - Allow rules: the invocation matches only when EVERY subcommand matches
+//     at least one rule, so "allowed-prefix && anything" cannot ride on the
+//     allowed prefix.
+//   - Deny/ask rules: the invocation matches when ANY subcommand matches ANY
+//     rule, so a denied tail cannot hide behind an innocent head.
+//
+// Tools without compound semantics implement MatchRule only and keep per-rule
+// whole-input matching.
+type CompoundRuleMatcher interface {
+	MatchAllSubcommands(rules []string, input map[string]any) bool
+	MatchAnySubcommand(rules []string, input map[string]any) bool
+}

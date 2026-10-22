@@ -11,7 +11,255 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Changed — agent loop resilience
+
+- **Model-call retry policy (behavior change):** with `ModelConfig.MaxRetries`
+  unset, `UnifiedAgent` now attempts a model call up to 3 times (was 1) before
+  failing the reply, with full-jitter exponential backoff starting from
+  `RetryDelay`. Only errors classified as transient (`model.IsRetryableError`)
+  are retried; permanent errors (4xx other than 429) fail fast on the primary
+  and still fall through to `FallbackModel`. Buffered and streaming paths share
+  the policy.
+- **Established stream replay:** a provider stream that fails before publishing
+  any text/thinking delta is re-attempted, since replay is invisible to
+  consumers. A stream that fails after publishing deltas still fails the reply
+  (partial output cannot be replayed without duplication); this narrows the
+  previous "established streams are never retried" behavior from #17.
+- **Context-window overflow recovery:** when a provider rejects a request as
+  too large (detected via the new `model.IsContextLimitExceeded`, which honors
+  `errors.ErrModelContextLimit` and the documented Anthropic/OpenAI/Gemini/
+  Ollama/DashScope/Moonshot wordings), the reply loop shrinks the context —
+  truncating oversized tool results first, then forcing a summarizing
+  compaction — and retries the same step, bounded at 3 recoveries per round.
+  Previously the reply failed immediately. Emits a `context_overflow_recovery`
+  custom event per attempt. When the agent never configured a `ContextConfig`,
+  the recovery arms the default one, so auto-compaction stays enabled for the
+  agent's remaining lifetime after the first overflow.
+- **Streamed tool calls with broken arguments** (e.g. JSON truncated mid-stream)
+  are committed and answered with a parse-error tool result so the model can
+  re-issue the call, instead of failing the whole reply; formatters already
+  repair such arguments for wire validity on later rounds. Tool calls without a
+  name still fail the reply as stream corruption. This narrows the #17
+  "incomplete tool calls are not committed" behavior.
+- **Tool-result truncation keeps head and tail:** `agent.TruncateToolResult`
+  now elides the middle with a `<<<TRUNCATED: N bytes elided>>>` marker instead
+  of cutting at a prefix `<<<TRUNCATED>>>` marker, since shell-log errors live
+  at the tail and file structure at the head. Cuts land on rune boundaries so
+  truncated output stays valid UTF-8. `agent.SplitToolResultForCompression`
+  keeps its prefix contract.
+- **Compression trigger grounded in actual usage:** the automatic compression
+  estimate now takes the max of the byte heuristic and the provider-reported
+  total input tokens of the last successful model call
+  (`ChatUsage.EffectiveInputTokens`; the new `ChatUsage.TotalInputTokens` field
+  carries Anthropic's cache-inclusive total, which its `input_tokens`
+  excludes), so CJK/JSON-heavy or cache-hit contexts — both systematically
+  under-counted — compact before the provider rejects the request. The floor
+  resets on every compaction.
+
+### Changed — permission rule matching
+
+- **BREAKING (behavior)** **Bash/Shell permission rules match conjunctively
+  across subcommands:** an allow rule for `git status:*` no longer covers
+  `git status && rm -rf /` — every subcommand of a compound command
+  (`&&`/`||`/`;`/`|`, command substitutions included) must match an allow rule
+  for the invocation to be allowed, while a deny rule fires when ANY
+  subcommand matches it. `tool.MatchRule` gains the sibling entry points
+  `MatchAllSubcommands`/`MatchAnySubcommand`, and the permission engine uses
+  them through the new `permission.CompoundRuleMatcher` interface when a
+  checker's tool supports AST analysis. Commands that fail to parse no longer
+  fall back to substring matching: they simply do not match, so unparseable
+  invocations degrade to Ask instead of inheriting an allow rule. Plain
+  single commands are unaffected.
+
+### Changed — project instructions
+
+- **Layered instruction files (behavior change, codex AGENTS.md parity):**
+  `LoadProjectConfig` now collects instruction files (CLAUDE.md / AGENTS.md /
+  README.md, first match per directory) from the project root down to the
+  working directory and concatenates them root→cwd, so deeper, more specific
+  instructions land last. The layering anchors at the nearest ancestor with a
+  `.git` entry instead of stopping at the first directory carrying an
+  instruction file — a nested CLAUDE.md stacks on the root one rather than
+  replacing it. Without any `.git`, the historical single-file lookup via
+  `FindProjectRoot` applies. The concatenated payload is capped at 32 KiB
+  (rune-boundary cut with a truncation marker) to keep oversized docs from
+  crowding out the working context.
+
 ### Added
+
+- **Background pre-compression** (`ContextConfig.PrecompressRatio`): when set
+  below `TriggerRatio`, the agent starts generating the compaction summary in
+  a background goroutine once the estimated context crosses the lower ratio,
+  off the reply's critical path. When the hard trigger later fires (or
+  `Compact` is called), a result whose snapshot is still valid — same base
+  summary, context prefix intact — applies instantly; stale or missing
+  results fall back to the synchronous path. The applied summary covers the
+  snapshot prefix, so messages appended since stay raw (a slightly earlier
+  next compaction in exchange for hidden latency). Background usage flows
+  through the same per-reply accounting as synchronous compression, with a
+  final drain at reply end so a generation finishing during the last model
+  call is still attributed to the reply that caused it. Disabled by default
+  and unavailable with `WithContentBlockCompaction`; a failed background
+  generation is discarded (the synchronous path owns retries and fallback).
+
+- **MCP elicitation** (codex `Op::ResolveElicitation` parity): MCP servers
+  can now ask for user input in the middle of a tool call. Set
+  `ElicitationHandler` (`mcp.ElicitationHandler`, with transport-neutral
+  `ElicitRequest`/`ElicitResponse` carrying accept/decline/cancel plus form
+  content) on `mcp.StdioConfig` or `streamablehttp.Config`; the client then
+  declares the elicitation capability during initialize and resolves
+  `elicitation/create` requests through the handler. Without a handler the
+  capability stays undeclared and such requests fail fast with -32601, as do
+  unknown server-initiated methods on stdio — previously a server request
+  with a string ID was silently dropped, hanging the server's in-flight tool
+  call. The stdio handler runs synchronously on the wire read loop (other
+  calls block meanwhile); the bare-POST `mcp.HttpClient` has no inbound
+  channel and does not support elicitation.
+
+- **`web_search` tool** (`tool.NewWebSearchTool`, codex parity): the model
+  searches the web through a host-injected `SearchFunc`, keeping provider
+  credentials and ranking outside the library — no new dependency. Read-only
+  and concurrency-safe; results are ranked title/URL/snippet hits, with
+  `limit` defaulting to 5 and capped at 10.
+
+- **User shell commands** (`Conversation.RunUserShellCommand`, codex `!`
+  parity): a user-typed shell command runs outside the model loop through
+  the platform shell with process-group isolation; merged stdout/stderr
+  stream as `user_shell_output` conversation events and a `user_shell_end`
+  event carries exit code and duration. The command never enters model
+  context and, being user-initiated, runs without the permission engine —
+  never route model-generated commands through it.
+
+- **Model stream idle timeout** (`ModelConfig.StreamIdleTimeout`, codex
+  `stream_idle_timeout` parity): a stream silent past the timeout — between
+  setup and the first chunk, or between chunks — is treated as a transport
+  failure: retried while nothing was published, failing the reply once
+  partial output escaped (never replaying rendered deltas). Unset selects a
+  5-minute default, so a wedged provider stream can no longer hang a reply
+  forever; a negative value disables the guard. Buffered (`Chat`) calls are
+  unaffected — provider transport timeouts govern those.
+
+- **Per-reply `turn_stats` custom event** (codex token-count parity): every
+  reply now reports its aggregate usage alongside the terminal ReplyEndEvent —
+  model calls, tool calls, iterations, duration, summed input/output/cache
+  tokens and the final provider-reported context fill
+  (`last_input_tokens`). Failed and interrupted replies report partial usage
+  so hosts can account burned tokens. Emitted before the end event on direct
+  terminal paths and right after the delivered end event when middleware
+  round-swallowing is in play (a swallowed round never publishes
+  partial-turn stats as final).
+
+- **`update_plan` tool** (`agent.WithPlanTool`, codex parity): the model
+  maintains a visible step plan — `{explanation?, plan: [{step, status}]}`,
+  at most one `in_progress` — stored in `AgentState.Plan` (new checkpointed
+  field), so the tracker survives compression and crash-resume. The plan is
+  re-injected into the model input after the summary on every call (and
+  counted in the compression split accounting), and each successful update
+  emits a `plan_updated` custom event for hosts to render live. The tool is
+  read-only for permission purposes (explore mode does not gate planning) and
+  deliberately not concurrency-safe: updates are ordered state transitions.
+
+- **`get_context_remaining` tool** (`agent.WithContextRemainingTool`, codex
+  parity): reports `{"tokens_left": N|null}` — the usage-grounded estimate
+  (max of the byte heuristic and the last provider-reported input tokens)
+  subtracted from the resolved context window. The model can check its budget
+  before starting an expensive subtask or deciding to compress early.
+
+- **Compression quality knobs** (`ContextConfig.CompactStrategy`,
+  `ContextConfig.SummaryMaxTokens`): `CompactStrategyFreshWindow` folds the
+  entire history into the summary instead of reserving a tail of recent
+  messages (codex `/compact` parity; default stays `reserve_tail`).
+  `SummaryMaxTokens` bounds the generated summary (default: window/32 clamped
+  to [1024, 8192]) with middle-elision on overflow, so a runaway summary
+  cannot silently re-inflate the window it freed. The default compression
+  prompt now carries a budget sentence and instructs preserving exact file
+  paths, commands and error messages verbatim. Fresh-window compaction never
+  strands an in-flight tool call: the split reserves the trailing open pair
+  (a zero reserve would orphan the result that lands right after, which
+  providers reject outright) — with nothing in flight at most the trailing
+  message survives.
+
+- **`UnifiedAgent.ForkSession`** (codex thread-fork parity): branches the
+  current session by snapshotting state through the checkpoint serialization
+  path and persisting it under a new session ID — context, summary, plan and
+  permission grants included — without touching the live session or its
+  checkpoint. The fork starts at a clean reply boundary (reply ID and
+  recovery counters cleared) and is a between-replies operation by contract.
+  Pair with `LoadCheckpoint` + `WithState` to run the branch.
+
+- **Durable permission rules learned from approvals**
+  (`permission.RuleStore`, `Engine.SetRuleStore`,
+  `Engine.AddRulePersistent`, `config.NewSettingsRuleStore`): when a user
+  approves a tool call with "always allow"-style rules, the agent writes the
+  rule through the configured store — the settings implementation appends to
+  `.agentscope/settings.local.json` (local overrides, not committed with
+  shared project settings) in the same format `LoadProjectConfig` reads back,
+  so learned rules apply to future sessions. On store failure the rule is NOT
+  applied in memory by the engine (a believed-persisted policy silently
+  reverting next session is the dangerous failure); the agent logs a warning
+  and falls back to in-memory so the approved call can still proceed.
+  `Engine.AddRule` keeps its in-memory-only behavior for configuration-loaded
+  rules — they must not be written back.
+
+- **Workspace-jail grants for file tools** (`tool.WithWorkspaceGrants`,
+  `tool.WorkspaceEscapeError`/`WorkspaceEscapeInfo`, grant suggested rules via
+  `permission.NewGrantDirRule`, `Engine.AddWorkingDirectory`/
+  `GrantedDirectories`/`SnapshotContext`/`MergeWorkingDirectories`): when a
+  file tool under a `tool.WithWorkspaceRoot` jail rejects a path outside the
+  root, the error response now carries typed escape metadata
+  (`tool.WorkspaceEscapeMetaKey`) and the agent intercepts it BEFORE emitting
+  a result: it prompts the user to grant access to the path (the path itself
+  when it exists — a file grant does not widen to its whole directory — or the
+  parent directory for a path yet to be created; a session-scoped
+  `grant:dir:<path>` suggested rule), records the grant in
+  `permission.Context.WorkingDirectories` — a field that was previously dead
+  — and re-executes the call once with the widened jail. Every working
+  directory in permission scope (host-declared and granted) now widens the
+  jail on every tool execution. Grants are checkpointed with the agent state
+  (checkpoints now sync `PermissionCtx` from the engine, previously it was
+  never saved) and merged back on resume; they are intentionally NOT written
+  to the rule store, matching per-session sandbox-escalation semantics.
+  Concurrent tool batches cannot prompt (their event channel is nil) — the
+  escape error stands there and the model can retry the call on its own.
+  Denied prompts return the escape error with a denial note so the model can
+  pick another approach. Bash/Shell commands are unaffected: their escape
+  surface is the command text, which the permission rules already cover.
+
+- Experimental persistent shell sessions (`tool.ShellManager` with the
+  `Shell`/`ShellStdin` tools, codex unified_exec parity): a long-running
+  shell process per named session whose working directory, exported variables
+  and foreground command survive across tool calls. Commands returning within
+  `yield_time_ms` report done with their exit code; longer commands keep
+  running and are polled or fed via `ShellStdin` (e.g. answering `read`
+  prompts). Output keeps head and tail within a byte budget, eliding the
+  middle. Cancelling a turn kills the session's process group (the session is
+  dropped and transparently recreated on next use). `Shell` reuses the `Bash`
+  permission pipeline (injection/danger heuristics, rule matching, rule
+  suggestions) under its own tool name. Requires a POSIX shell;
+  `NewShellManager` fails on Windows shells. The tools are opt-in: register
+  them via `Toolkit.AddGroup` (they are not in `NewEnhancedToolkit`'s default
+  set). Known limitations: commands must be single-line (heredoc bodies can be
+  fed via `ShellStdin`); `exit`/`exec` terminate the session and reset its
+  state; there is no PTY, so control bytes are literal input; `ShellStdin`
+  inherits the session command's earlier permission check rather than applying
+  codex-style per-write approval. See STABILITY.md for the Experimental tier
+  note.
+
+- Experimental `agent.Conversation` (`UnifiedAgent.NewConversation`): a
+  persistent turn kernel with session semantics for chat-style hosts.
+  `Submit` queues user input — starting a turn when idle, or steering it into
+  the active turn at the certified boundary (a StateReason iteration, where no
+  tool call awaits its result, so injection can never split a
+  tool_call/tool_result pair) — with an immediate checkpoint and a
+  `conversation_input_injected` event per batch. `Interrupt` cancels the turn
+  context (killing in-flight tool processes), still delivers the terminal
+  `ReplyEnd` on the session-lifetime stream, appends a model-visible
+  interruption marker, and retains pending input for the next turn — a
+  deliberate divergence from codex, which discards pending input on
+  interrupt. `Compact` queues a forced compression to the same boundary, or
+  runs immediately between turns. While a conversation is active, direct
+  `Reply`/`ReplyStream`/`ResumeReplyStream` calls are rejected; `Close`
+  releases the agent. See STABILITY.md for the Experimental tier note.
 
 - `mcp/streamablehttp` provides a Streamable HTTP client for MCP (#55, #63),
   backed by the official `modelcontextprotocol/go-sdk` (pinned v1.8.0) — the

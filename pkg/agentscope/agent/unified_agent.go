@@ -31,6 +31,27 @@ import (
 const (
 	defaultUnifiedMaxIters = 20
 	defaultTriggerRatio    = 0.8
+
+	// defaultModelAttempts is the default number of model-call attempts
+	// (initial try plus retries) when ModelConfig.MaxRetries is unset.
+	// Transient provider failures (429/5xx/network) are the norm over a
+	// long agent run; failing the whole reply on the first blip makes the
+	// agent unusable. Only errors classified as transient are retried.
+	defaultModelAttempts = 3
+
+	// defaultStreamIdleTimeout is the default maximum silence on a model
+	// stream (5 minutes, codex stream_idle_timeout_ms parity). A stream
+	// silent this long is effectively dead; continuing to wait would hang
+	// the reply forever.
+	defaultStreamIdleTimeout = 5 * time.Minute
+
+	// maxContextOverflowRecoveries bounds how often one reasoning-acting
+	// round may recover from a provider context-window rejection. Each
+	// recovery shrinks the context (tool-result truncation first, then a
+	// forced compaction); a request that still overflows after this many
+	// shrinks is wedged (e.g. a single message larger than the window) and
+	// must surface as an error instead of looping.
+	maxContextOverflowRecoveries = 3
 )
 
 // UnifiedAgent is the v2 agent that uses native tool calling and supports streaming.
@@ -51,6 +72,12 @@ type UnifiedAgent struct {
 
 	contentBlockCompaction bool
 	compactionVersion      uint64
+
+	// lastModelInputTokens is the provider-reported input size of the most
+	// recent successful model call. It grounds the compression trigger:
+	// byte-based estimates misjudge JSON tool blocks, code and CJK text,
+	// while the provider's own count is exact for the request it served.
+	lastModelInputTokens int
 
 	confirmCh      chan event.UserConfirmResultEvent
 	externalCh     chan event.ExternalExecutionResultEvent
@@ -73,7 +100,32 @@ type UnifiedAgent struct {
 	// agentDrivenCompression registers the compress_context tool so the
 	// model itself can trigger compression (upstream #2143).
 	agentDrivenCompression bool
-	modelStreaming         bool
+	// planToolEnabled / contextRemainingEnabled register the update_plan and
+	// get_context_remaining tools (see WithPlanTool/WithContextRemainingTool).
+	planToolEnabled         bool
+	contextRemainingEnabled bool
+	modelStreaming          bool
+
+	// activeConv, when non-nil, is the Conversation owning this agent:
+	// direct Reply/ReplyStream/ResumeReplyStream calls are rejected for the
+	// conversation's lifetime and turns enter through Conversation.Submit.
+	// activeReplies counts in-flight replies so NewConversation can refuse
+	// to take over a busy agent. Both are guarded by mu.
+	activeConv    *Conversation
+	activeReplies int
+
+	// stats accumulates per-reply usage for the turn_stats event. It stays
+	// installed after the reply ends so a swallowed round keeps
+	// accumulating; the next replyLoop's beginTurnStats replaces it.
+	stats *turnStats
+
+	// Background pre-compression (ContextConfig.PrecompressRatio):
+	// precompressRunning marks an in-flight generation; pendingPrecompress
+	// holds a finished result until the hard compression trigger applies or
+	// discards it. Both are guarded by mu. Neither is checkpointed — a
+	// resumed reply simply regenerates.
+	precompressRunning bool
+	pendingPrecompress *precompressResult
 }
 
 // ReactConfig controls the ReAct reasoning-acting loop.
@@ -87,6 +139,14 @@ type ModelConfig struct {
 	MaxRetries    int
 	RetryDelay    time.Duration
 	FallbackModel model.ChatModel
+
+	// StreamIdleTimeout bounds the silence a model stream may produce: the
+	// gap between stream setup and the first chunk, and between any two
+	// chunks. A silent stream is treated as a transport failure — retried
+	// while nothing was published, failing the reply once partial output
+	// escaped (codex stream_idle_timeout parity). Zero selects the default
+	// (defaultStreamIdleTimeout); a negative value disables the guard.
+	StreamIdleTimeout time.Duration
 }
 
 // AgentState holds conversation state for a session.
@@ -109,6 +169,9 @@ type AgentState struct {
 	TasksCtx        *TasksStateContext  `json:"tasks_context,omitempty"`
 	MiddlewareState map[string]any      `json:"middleware_context,omitempty"`
 	ReadCacheData   json.RawMessage     `json:"read_cache_data,omitempty"`
+	// Plan is the current update_plan tracker state (see WithPlanTool). It
+	// lives outside Context so compression and crash-resume preserve it.
+	Plan []tool.PlanItem `json:"plan,omitempty"`
 }
 
 // ToolStateContext captures which tool groups are active for serialization.
@@ -288,11 +351,25 @@ func NewUnifiedAgent(name, systemPrompt string, m model.ChatModel, opts ...Agent
 	for _, opt := range opts {
 		opt(a)
 	}
+	// Restore session-granted working directories from a checkpoint. Rules
+	// and mode are NOT merged back: learned rules persist through the
+	// RuleStore/settings path, and the host's fresh configuration stays the
+	// authority on both.
+	if a.engine != nil && a.state != nil && a.state.PermissionCtx != nil {
+		a.engine.MergeWorkingDirectories(a.state.PermissionCtx.WorkingDirectories)
+	}
 	// Upstream #2143: register the agent-driven compression tool AFTER all
 	// options ran, so a WithToolkit replacement does not drop it.
 	if a.agentDrivenCompression && a.toolkit != nil {
 		a.toolkit.AddGroup("context_management",
 			tool.NewCompressContextTool(a.compressContextForTool))
+	}
+	// Same late-registration rationale for the plan and context-budget tools.
+	if a.planToolEnabled && a.toolkit != nil {
+		a.toolkit.AddGroup("plan", tool.NewUpdatePlanTool(a.updatePlanFromTool))
+	}
+	if a.contextRemainingEnabled && a.toolkit != nil {
+		a.toolkit.AddGroup("context_budget", tool.NewContextRemainingTool(a.contextRemainingForTool))
 	}
 	return a
 }
@@ -347,6 +424,9 @@ func (a *UnifiedAgent) Reply(ctx context.Context, input string) (*message.Msg, e
 }
 
 // ReplyStream processes input and returns a channel of events (streaming).
+// Callers must drain the channel until it closes (or cancel ctx): an
+// abandoned stream wedges the forwarder and keeps the agent's in-flight
+// reply slot held, which also blocks NewConversation.
 func (a *UnifiedAgent) ReplyStream(ctx context.Context, input string) (<-chan event.Event, error) {
 	return a.replyStream(ctx, input, false)
 }
@@ -356,6 +436,18 @@ func (a *UnifiedAgent) replyStream(ctx context.Context, input string, resume boo
 		return nil, fmt.Errorf("agent %s: empty input", a.name)
 	}
 
+	// Conversation exclusivity: while a Conversation owns the agent, only
+	// its own turns (carrying the conversation handle) may run.
+	a.mu.Lock()
+	if a.activeConv != nil {
+		if th := conversationTurnFrom(ctx); th == nil || th.conv != a.activeConv {
+			a.mu.Unlock()
+			return nil, fmt.Errorf("agent %s: a conversation is active; submit input via Conversation.Submit", a.name)
+		}
+	}
+	a.activeReplies++
+	a.mu.Unlock()
+
 	// Attach MiddleContext to the Go context for middleware state storage.
 	mc := middleware.MiddleContext{}
 	ctx = middleware.WithMiddleContext(ctx, mc)
@@ -364,6 +456,7 @@ func (a *UnifiedAgent) replyStream(ctx context.Context, input string, resume boo
 		var err error
 		ctx, run, err = a.beginRecovery(ctx, resume)
 		if err != nil {
+			a.replyDone()
 			return nil, err
 		}
 	}
@@ -409,6 +502,14 @@ func (a *UnifiedAgent) replyStream(ctx context.Context, input string, resume boo
 	go func() {
 		defer close(out)
 		defer a.sealRecovery(run)
+		defer a.replyDone()
+		// Conversation turns keep forwarding on the session context: after
+		// Interrupt cancels the turn context, the terminal ReplyEnd must
+		// still escape instead of racing ctx.Done() in the select below.
+		fwdCtx := ctx
+		if th := conversationTurnFrom(ctx); th != nil {
+			fwdCtx = th.conv.ctx
+		}
 		var curReplyID string
 		failurePublished := false
 		sawEnd := false
@@ -438,20 +539,32 @@ func (a *UnifiedAgent) replyStream(ctx context.Context, input string, resume boo
 			}
 			select {
 			case out <- evt:
-			case <-ctx.Done():
+			case <-fwdCtx.Done():
 				return
 			}
 		}
 		if run != nil && run.err() != nil && !failurePublished {
-			emit(ctx, out, event.NewReplyEndEventWithError(a.state.SessionID, curReplyID, types.ErrorInternal, checkpointError(run.err()).Message))
+			emit(fwdCtx, out, event.NewReplyEndEventWithError(a.state.SessionID, curReplyID, types.ErrorInternal, checkpointError(run.err()).Message))
 		}
 	}()
 	return out, nil
 }
 
+// replyDone releases one in-flight reply slot (see activeReplies).
+func (a *UnifiedAgent) replyDone() {
+	a.mu.Lock()
+	a.activeReplies--
+	a.mu.Unlock()
+}
+
 // Observe injects external messages into the agent's context.
 // It validates each message: system-role messages and messages containing
 // tool_call, tool_result, or thinking blocks are rejected.
+//
+// Observe is not safe to call while a reply is running: an injection that
+// lands between a pending tool_call and its tool_result splits the pair and
+// orphans the call. When a Conversation is active, use Conversation.Submit
+// instead — it injects only at the certified StateReason boundary.
 func (a *UnifiedAgent) Observe(ctx context.Context, msgs []*message.Msg) error {
 	for _, m := range msgs {
 		if m == nil {
@@ -523,6 +636,16 @@ const roundBoundSentinel = "agentscope.round_bound"
 func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- event.Event, verdict <-chan bool) {
 	defer close(ch)
 
+	// Conversation turns emit terminal events on the session context:
+	// Interrupt cancels the turn context before these fire, and a
+	// canceled-ctx select may silently drop the ReplyEnd (the host would
+	// see the turn hang). Non-conversation replies keep ctx, so behavior
+	// is unchanged outside conversations.
+	endCtx := ctx
+	if th := conversationTurnFrom(ctx); th != nil {
+		endCtx = th.conv.ctx
+	}
+
 	hooks := a.hookRunner
 	if hooks == nil {
 		hooks = loop.NewHookRunner()
@@ -549,6 +672,7 @@ func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- ev
 		a.state.CurIter = 0
 	}
 	a.mu.Unlock()
+	a.beginTurnStats()
 
 	// HARNESS_DESIGN A2: make the reply ID visible to middleware hooks
 	// (recorders, etc.) via the MiddleContext and to audit loggers via ctx.
@@ -571,7 +695,8 @@ func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- ev
 
 	if run != nil {
 		if err := a.checkpointBoundary(ctx); err != nil {
-			emit(ctx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, types.ErrorInternal, checkpointError(err).Message))
+			a.emitTurnStats(endCtx, ch, replyID)
+			emit(endCtx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, types.ErrorInternal, checkpointError(err).Message))
 			return
 		}
 	}
@@ -589,7 +714,8 @@ func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- ev
 	for {
 		reason, progress, errInfo := a.reactRound(ctx, ch, replyID, hooks, modelCallHandler, actingHandler)
 		if run != nil && run.err() != nil {
-			emit(ctx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, types.ErrorInternal, checkpointError(run.err()).Message))
+			a.emitTurnStats(endCtx, ch, replyID)
+			emit(endCtx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, types.ErrorInternal, checkpointError(run.err()).Message))
 			return
 		}
 		if progress {
@@ -598,20 +724,24 @@ func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- ev
 
 		if reason == types.ReplyInterrupted {
 			// Cannot be swallowed to continue the reply (Python parity).
-			emit(ctx, ch, event.NewReplyEndEventWithReason(a.state.SessionID, replyID, reason))
+			a.emitTurnStats(endCtx, ch, replyID)
+			emit(endCtx, ch, event.NewReplyEndEventWithReason(a.state.SessionID, replyID, reason))
 			return
 		}
 
 		if errInfo != nil {
-			emit(ctx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, errInfo.Type, errInfo.Message))
+			emit(endCtx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID, errInfo.Type, errInfo.Message))
 		} else {
-			emit(ctx, ch, event.NewReplyEndEventWithReason(a.state.SessionID, replyID, reason))
+			emit(endCtx, ch, event.NewReplyEndEventWithReason(a.state.SessionID, replyID, reason))
 		}
 
 		emit(ctx, ch, event.NewCustomEvent(replyID, roundBoundSentinel, nil))
 		select {
 		case delivered := <-verdict:
 			if delivered {
+				// The end event escaped; stats follow it (a swallowed round
+				// must not surface partial-turn stats as final).
+				a.emitTurnStats(endCtx, ch, replyID)
 				return
 			}
 			// Swallowed: force another round — unless the middleware keeps
@@ -623,7 +753,8 @@ func (a *UnifiedAgent) replyLoop(ctx context.Context, input string, ch chan<- ev
 					"error": "a middleware swallowed the ReplyEndEvent twice without progress",
 				}))
 				// Keep the reply start/end pairing intact.
-				emit(ctx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID,
+				a.emitTurnStats(endCtx, ch, replyID)
+				emit(endCtx, ch, event.NewReplyEndEventWithError(a.state.SessionID, replyID,
 					types.ErrorInternal, "ReplyEndEvent swallowed repeatedly without progress"))
 				return
 			}
@@ -651,12 +782,14 @@ func (a *UnifiedAgent) reactRound(
 	curState := protocol.StateReason
 	finishedNormally := false
 
+	overflowRecoveries := 0
 	startIteration := 0
 	if run := recoveryRun(ctx); run != nil {
 		startIteration = run.iteration()
 	}
 reactLoop:
 	for iter := startIteration; iter < a.reactCfg.MaxIters; iter++ {
+		a.recordIteration(iter)
 		if run := recoveryRun(ctx); run != nil {
 			run.setIteration(iter)
 		}
@@ -708,6 +841,7 @@ reactLoop:
 		case protocol.StateAct:
 			// Execute pending tool calls from prior iteration
 			toolCalls := a.getExecutableToolCalls()
+			a.recordToolCalls(len(toolCalls))
 			batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
 			for _, batch := range batches {
 				if batch.concurrent && len(batch.calls) > 1 {
@@ -742,6 +876,18 @@ reactLoop:
 			continue
 
 		case protocol.StateReason:
+			// Conversation steering drain (EXPERIMENTAL): user input queued
+			// via Conversation.Submit during the turn is injected here — the
+			// certified boundary where checkNextAction has confirmed no tool
+			// call awaits its result, so appending user messages can never
+			// split a tool_call/tool_result pair (ad-hoc mid-turn Observe
+			// injection lacks this guarantee).
+			if th := conversationTurnFrom(ctx); th != nil {
+				if err := a.drainConversationOps(ctx, ch, replyID, th.conv); err != nil {
+					return types.ReplyError, madeProgress, checkpointError(err)
+				}
+			}
+
 			// Compress context before model call. Detect whether compression
 			// actually happened by observing state.Summary change, and emit a
 			// "compacted" CustomEvent so consumers can surface it (e.g. lathe's
@@ -764,6 +910,7 @@ reactLoop:
 			// model-call-end event so budgets, cost tracking and
 			// reply-message accounting include it.
 			if cu := a.takeCompressionUsage(); cu != nil {
+				a.recordModelCallUsage(cu)
 				emit(ctx, ch, event.NewModelCallEndEventWithCache(replyID,
 					cu.InputTokens, cu.OutputTokens,
 					cu.CacheCreationInputTokens, cu.CacheInputTokens))
@@ -789,6 +936,21 @@ reactLoop:
 				emitModelCallEnd(ctx, ch, replyID, resp)
 				if ctx.Err() != nil {
 					return types.ReplyInterrupted, madeProgress, nil
+				}
+				// The provider rejected the request as too large. The token
+				// estimate that gates automatic compression is heuristic, so
+				// this happens in practice; recover like codex does: shrink
+				// the context and retry the same step instead of killing the
+				// reply. Bounded so a wedged request still fails honestly.
+				if model.IsContextLimitExceeded(err) && overflowRecoveries < maxContextOverflowRecoveries {
+					overflowRecoveries++
+					logrus.WithError(err).WithField("agent", a.name).Warn(
+						"provider reports context overflow; shrinking context and retrying")
+					emit(ctx, ch, event.NewCustomEvent(replyID, "context_overflow_recovery",
+						map[string]any{"attempt": overflowRecoveries}))
+					a.recoverContextOverflow(ctx)
+					iter--
+					continue
 				}
 				info := classifyReplyError(err)
 				return types.ReplyError, madeProgress, &info
@@ -817,7 +979,13 @@ reactLoop:
 				outputTok = resp.Usage.OutputTokens
 				cacheCreate = resp.Usage.CacheCreationInputTokens
 				cacheRead = resp.Usage.CacheInputTokens
+				if total := resp.Usage.EffectiveInputTokens(); total > 0 {
+					a.mu.Lock()
+					a.lastModelInputTokens = total
+					a.mu.Unlock()
+				}
 			}
+			a.recordModelCallUsage(resp.Usage)
 			emit(ctx, ch, event.NewModelCallEndEventWithCache(replyID, inputTok, outputTok, cacheCreate, cacheRead))
 
 			// Transition to Inspect after model call
@@ -856,6 +1024,7 @@ reactLoop:
 			curState = protocol.StateAct
 
 			// Execute tool calls
+			a.recordToolCalls(len(toolCalls))
 			batches := batchToolCalls(toolCalls, a.toolkit, a.wouldRequireHITL)
 			for _, batch := range batches {
 				if batch.concurrent && len(batch.calls) > 1 {
@@ -914,6 +1083,10 @@ func classifyReplyError(err error) types.ReplyErrorInfo {
 	case errors.Is(err, agenterrors.ErrModelTimeout):
 		t = types.ErrorConnection
 	case errors.Is(err, agenterrors.ErrModelContextLimit):
+		t = types.ErrorInvalidRequest
+	case model.IsContextLimitExceeded(err):
+		// Adapters surface overflow as plain HTTP error strings; give them
+		// the same taxonomy slot as the typed sentinel.
 		t = types.ErrorInvalidRequest
 	}
 	var ae *agenterrors.AgentError
@@ -1052,6 +1225,15 @@ func (a *UnifiedAgent) executeToolCallWithPermission(
 		return a.executeExternalTool(ctx, ch, replyID, tc, t, wasSubmitted)
 	}
 
+	// Widen the file-tool path jail with every working directory in
+	// permission scope: the host-declared session directories plus any the
+	// user granted after a jail escape. No-op for tools that never consult
+	// the jail.
+	if a.engine != nil {
+		if dirs := a.engine.GrantedDirectories(); len(dirs) > 0 {
+			ctx = tool.WithWorkspaceGrants(ctx, dirs)
+		}
+	}
 	return a.executeTool(ctx, ch, replyID, tc, actingHandler)
 }
 
@@ -1078,10 +1260,22 @@ func (a *UnifiedAgent) waitForConfirmation(ctx context.Context, toolCallID strin
 			}
 			if match != nil {
 				if match.Confirmed {
-					// Add any user-provided rules to the engine
+					// Add user-approved rules to the engine, persisting them
+					// through the configured RuleStore when one is set so
+					// "always allow" survives the session. Directory-grant
+					// rules are intercepted first: they widen the file-tool
+					// jail for the session and are neither evaluated as
+					// permission rules nor written to the rule store.
 					for _, r := range match.Rules {
 						if rule, ok := r.(permission.Rule); ok {
-							a.engine.AddRule(rule)
+							if dir, isGrant := permission.ParseGrantDirRule(rule); isGrant {
+								a.engine.AddWorkingDirectory(permission.WorkingDirectory{Path: dir, Source: "granted"})
+								continue
+							}
+							if err := a.engine.AddRulePersistent(rule); err != nil {
+								logrus.WithError(err).WithField("agent", a.name).Warn("persist permission rule failed; applying in memory only")
+								a.engine.AddRule(rule)
+							}
 						}
 					}
 					return true, match.ToolCall
@@ -1267,7 +1461,21 @@ func (a *UnifiedAgent) executeTool(
 			extra = nonTextBlocks(toolResp.Content)
 		}
 	}
-	return a.emitToolResultWithExtra(ctx, ch, replyID, tc, resultState, outputText, extra, toolMeta)
+	// A workspace-jail escape arrives as an error response carrying escape
+	// metadata. Intercept BEFORE emitting the result so the stream shows a
+	// single outcome for the call: prompt for a directory grant and retry,
+	// rather than a dead-end error the model can only report back.
+	// Concurrent batches (ch == nil) and grant retries (escapeRetriedKey)
+	// skip the prompt — see handleWorkspaceEscape.
+	if esc, ok := workspaceEscapeFromMeta(toolMeta); ok && resultState == message.ToolResultError &&
+		ch != nil && a.engine != nil && ctx.Value(escapeRetriedKey{}) == nil {
+		return a.handleWorkspaceEscape(ctx, ch, replyID, tc, actingHandler, esc, outputText)
+	}
+	outcome := a.emitToolResultWithExtra(ctx, ch, replyID, tc, resultState, outputText, extra, toolMeta)
+	// update_plan surfaces a plan_updated custom event so hosts can render
+	// the tracker live; the metadata marker travels with the tool response.
+	emitPlanUpdateIfPresent(ctx, ch, replyID, resultState, toolMeta)
+	return outcome
 }
 
 // executeStreamingTool runs a StreamingTool and emits incremental events.
@@ -1495,6 +1703,11 @@ func (a *UnifiedAgent) prepareModelInput(ctx context.Context) []*message.Msg {
 	if a.state.Summary != "" {
 		msgs = append(msgs, message.UserMsg(a.name, "[Previous context summary]: "+a.state.Summary))
 	}
+	// The plan lives outside Context precisely so it survives compression;
+	// re-inject it on every call or the model loses its tracker after one.
+	if len(a.state.Plan) > 0 {
+		msgs = append(msgs, planPromptMsg(a.name, a.state.Plan))
+	}
 
 	msgs = append(msgs, a.state.Context...)
 	return msgs
@@ -1503,17 +1716,17 @@ func (a *UnifiedAgent) prepareModelInput(ctx context.Context) []*message.Msg {
 func (a *UnifiedAgent) callModel(ctx context.Context, msgs []*message.Msg, opts []model.CallOption) (*model.ChatResponse, error) {
 	retries := a.modelCfg.MaxRetries
 	if retries <= 0 {
-		retries = 1
+		retries = defaultModelAttempts
 	}
 	delay := a.modelCfg.RetryDelay
-	if delay == 0 {
+	if delay <= 0 {
 		delay = time.Second
 	}
 
 	var lastErr error
 	for i := 0; i < retries; i++ {
 		if i > 0 {
-			timer := time.NewTimer(delay)
+			timer := time.NewTimer(retryBackoff(delay, i))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -1533,6 +1746,14 @@ func (a *UnifiedAgent) callModel(ctx context.Context, msgs []*message.Msg, opts 
 		}
 		if err == nil {
 			return resp, nil
+		}
+		// Permanent errors (4xx other than 429) are not worth retrying on
+		// the same model; stop retrying and let the fallback try. A
+		// context-window rejection also stops retries: the fallback may
+		// have a larger window, and the reply loop compacts otherwise.
+		if model.IsContextLimitExceeded(err) || !model.IsRetryableError(err) {
+			lastErr = err
+			break
 		}
 		lastErr = err
 	}
@@ -1849,6 +2070,7 @@ func (a *UnifiedAgent) forcedFinalSummary(ctx context.Context, ch chan<- event.E
 		cacheCreate = resp.Usage.CacheCreationInputTokens
 		cacheRead = resp.Usage.CacheInputTokens
 	}
+	a.recordModelCallUsage(resp.Usage)
 	emit(ctx, ch, event.NewModelCallEndEventWithCache(replyID, inputTok, outputTok, cacheCreate, cacheRead))
 
 	// tool_choice "none" is a request, not a guarantee: local and

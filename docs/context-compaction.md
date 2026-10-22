@@ -22,6 +22,24 @@ shows the imports and construction. This is an opt-in experiment from
 [RFC #11](https://github.com/agentscope-ai/agentscope-go/issues/11), scoped in
 [#53](https://github.com/agentscope-ai/agentscope-go/issues/53).
 
+## Background pre-compression
+
+`ContextConfig.PrecompressRatio` (opt-in, normalized to 0 when not below
+`TriggerRatio`) hides summarization latency: once the estimated context
+crosses `ContextSize*PrecompressRatio`, the agent generates the compaction
+summary in a background goroutine from a context snapshot. When the hard
+trigger later fires — or the host calls `Compact` — a still-valid result
+applies instantly; stale results (checkpoint rollback, an interleaved
+compaction) are discarded and the synchronous path runs as before.
+
+The summary covers the snapshot prefix: messages appended since the snapshot
+stay raw, so the window refills somewhat sooner after an applied
+pre-compression than after a synchronous one. Background generations burn
+tokens and are accounted like synchronous ones (per-reply usage and a
+model-call-end event). A failed background generation is discarded without
+retry — the synchronous path owns retries and the truncation fallback.
+Pre-compression is unavailable with `WithContentBlockCompaction`.
+
 ## Retention policy
 
 Successive model/tool rounds can share one assistant message. The default

@@ -11,9 +11,14 @@ import (
 // workspaceRootKey is the context key carrying the workspace-root jail.
 type workspaceRootKey struct{}
 
+// workspaceGrantsKey is the context key carrying session-granted directories
+// that widen the workspace-root jail.
+type workspaceGrantsKey struct{}
+
 // WithWorkspaceRoot confines file-tool path resolution to root. Any path that
-// resolves (symlinks included) outside root is rejected. When no root is set,
-// path resolution is unconfined (backward-compatible default).
+// resolves (symlinks included) outside root is rejected unless covered by a
+// WithWorkspaceGrants directory. When no root is set, path resolution is
+// unconfined (backward-compatible default) and grants are irrelevant.
 func WithWorkspaceRoot(ctx context.Context, root string) context.Context {
 	return context.WithValue(ctx, workspaceRootKey{}, root)
 }
@@ -24,6 +29,53 @@ func getWorkspaceRoot(ctx context.Context) string {
 		return r
 	}
 	return ""
+}
+
+// WithWorkspaceGrants widens the workspace-root jail to additionally cover
+// dirs. Grants model user-approved access beyond the workspace (e.g. an
+// escape the user confirmed in session); they never narrow the jail and are
+// ignored when no root is set. The slice is copied.
+func WithWorkspaceGrants(ctx context.Context, dirs []string) context.Context {
+	if len(dirs) == 0 {
+		return ctx
+	}
+	cp := append([]string(nil), dirs...)
+	return context.WithValue(ctx, workspaceGrantsKey{}, cp)
+}
+
+// getWorkspaceGrants returns the session-granted directories, or nil.
+func getWorkspaceGrants(ctx context.Context) []string {
+	if g, ok := ctx.Value(workspaceGrantsKey{}).([]string); ok {
+		return g
+	}
+	return nil
+}
+
+// WorkspaceEscapeMetaKey marks a tool error response whose cause is the
+// workspace jail rejecting a path. NewErrorResponse attaches it (as a
+// WorkspaceEscapeInfo value) when the error chain holds a
+// *WorkspaceEscapeError, letting the agent layer offer a grant prompt
+// instead of surfacing a dead-end error.
+const WorkspaceEscapeMetaKey = "workspace_escape"
+
+// WorkspaceEscapeInfo describes a jail escape for ToolResponse.Metadata.
+type WorkspaceEscapeInfo struct {
+	// Path is the offending path as supplied in the tool input.
+	Path string `json:"path"`
+	// Root is the active workspace root the path escaped.
+	Root string `json:"root"`
+}
+
+// WorkspaceEscapeError is returned by resolvePath when a jailed path escapes
+// the workspace root and no session grant covers it.
+type WorkspaceEscapeError struct {
+	Path string
+	Root string
+}
+
+// Error implements error.
+func (e *WorkspaceEscapeError) Error() string {
+	return fmt.Sprintf("path %q escapes workspace root %q", e.Path, e.Root)
 }
 
 // resolvePath resolves path to an absolute, cleaned path. If a workspace root is
@@ -54,7 +106,21 @@ func resolvePath(ctx context.Context, path string) (string, error) {
 	target := evalSymlinksLenient(abs)
 
 	if !withinRoot(rootAbs, target) {
-		return "", fmt.Errorf("path %q escapes workspace root %q", path, root)
+		// Session grants widen the jail: each granted directory is resolved
+		// like the root and must contain the target.
+		for _, grant := range getWorkspaceGrants(ctx) {
+			grantAbs, err := filepath.Abs(grant)
+			if err != nil {
+				continue
+			}
+			if resolved, err := filepath.EvalSymlinks(grantAbs); err == nil {
+				grantAbs = resolved
+			}
+			if withinRoot(grantAbs, target) {
+				return abs, nil
+			}
+		}
+		return "", &WorkspaceEscapeError{Path: path, Root: root}
 	}
 	return abs, nil
 }

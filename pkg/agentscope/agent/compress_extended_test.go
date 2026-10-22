@@ -503,7 +503,7 @@ func TestCompressContext_ToolResultTruncationWithOffloader(t *testing.T) {
 				if !ok {
 					t.Fatal("expected string output")
 				}
-				if !strings.Contains(output, "<<<TRUNCATED>>>") {
+				if !strings.Contains(output, "<<<TRUNCATED:") {
 					t.Error("output should contain truncation marker")
 				}
 				if !strings.Contains(output, "offloaded") {

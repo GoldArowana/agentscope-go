@@ -7,6 +7,7 @@ import (
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/permission"
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/tool"
 )
 
 // agentStateJSON is the JSON-friendly representation of AgentState.
@@ -23,6 +24,7 @@ type agentStateJSON struct {
 	TasksCtx        *TasksStateContext  `json:"tasks_context,omitempty"`
 	MiddlewareState map[string]any      `json:"middleware_context,omitempty"`
 	ReadCacheData   json.RawMessage     `json:"read_cache_data,omitempty"`
+	Plan            []tool.PlanItem     `json:"plan,omitempty"`
 }
 
 // MarshalJSON serializes AgentState to JSON.
@@ -40,6 +42,7 @@ func (s *AgentState) MarshalJSON() ([]byte, error) {
 		TasksCtx:        s.TasksCtx,
 		MiddlewareState: s.MiddlewareState,
 		ReadCacheData:   s.ReadCacheData,
+		Plan:            s.Plan,
 	})
 }
 
@@ -61,6 +64,7 @@ func (s *AgentState) UnmarshalJSON(data []byte) error {
 	s.TasksCtx = raw.TasksCtx
 	s.MiddlewareState = raw.MiddlewareState
 	s.ReadCacheData = raw.ReadCacheData
+	s.Plan = raw.Plan
 	return nil
 }
 

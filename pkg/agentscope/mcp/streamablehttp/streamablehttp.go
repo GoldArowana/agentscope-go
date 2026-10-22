@@ -35,6 +35,11 @@ type Config struct {
 	// (e.g. "2025-03-26"). Empty negotiates automatically from the SDK's
 	// supported versions. Exposed for testing and debugging.
 	ProtocolVersion string
+	// ElicitationHandler, when non-nil, resolves elicitation/create requests
+	// the server sends mid-call; the SDK then declares the elicitation
+	// capability automatically. Nil disables elicitation: a server that
+	// still sends elicitation/create gets an error reply.
+	ElicitationHandler mcp.ElicitationHandler
 }
 
 // Client communicates with an MCP server over Streamable HTTP. Session state
@@ -68,7 +73,13 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 		Endpoint:   cfg.BaseURL,
 		HTTPClient: httpClient,
 	}
-	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "agentscope-go", Version: "2.0"}, nil)
+	var clientOpts *sdkmcp.ClientOptions
+	if cfg.ElicitationHandler != nil {
+		clientOpts = &sdkmcp.ClientOptions{
+			ElicitationHandler: adaptElicitationHandler(cfg.ElicitationHandler),
+		}
+	}
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "agentscope-go", Version: "2.0"}, clientOpts)
 	var opts *sdkmcp.ClientSessionOptions
 	if cfg.ProtocolVersion != "" {
 		opts = &sdkmcp.ClientSessionOptions{ProtocolVersion: cfg.ProtocolVersion}
@@ -78,6 +89,44 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("streamablehttp: connect: %w", err)
 	}
 	return &Client{session: session}, nil
+}
+
+// adaptElicitationHandler bridges the SDK's elicitation callback to the
+// transport-neutral mcp.ElicitationHandler. The SDK validates the accepted
+// content against the requested schema before replying to the server.
+func adaptElicitationHandler(h mcp.ElicitationHandler) func(context.Context, *sdkmcp.ElicitRequest) (*sdkmcp.ElicitResult, error) {
+	return func(ctx context.Context, req *sdkmcp.ElicitRequest) (*sdkmcp.ElicitResult, error) {
+		var elicitReq mcp.ElicitRequest
+		if req.Params != nil {
+			elicitReq.Message = req.Params.Message
+			if req.Params.RequestedSchema != nil {
+				// The SDK decoded the schema into a generic value; re-marshal
+				// to carry it verbatim.
+				schema, err := json.Marshal(req.Params.RequestedSchema)
+				if err != nil {
+					return nil, fmt.Errorf("streamablehttp: marshal requested schema: %w", err)
+				}
+				elicitReq.RequestedSchema = schema
+			}
+		}
+		res, err := h(ctx, elicitReq)
+		if err != nil {
+			return nil, err
+		}
+		action := res.Action
+		switch action {
+		case mcp.ElicitAccept, mcp.ElicitDecline, mcp.ElicitCancel:
+		default:
+			// A handler bug must not put an invalid action on the wire;
+			// treat it as a dismissal.
+			action = mcp.ElicitCancel
+		}
+		result := &sdkmcp.ElicitResult{Action: action}
+		if action == mcp.ElicitAccept {
+			result.Content = res.Content
+		}
+		return result, nil
+	}
 }
 
 // ListTools queries the MCP server for available tools.

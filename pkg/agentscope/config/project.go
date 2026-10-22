@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/permission"
 )
@@ -42,12 +44,20 @@ type HookConfig struct {
 }
 
 // instructionFiles are the candidate filenames for project instructions,
-// checked in priority order.
+// checked in priority order within each directory.
 var instructionFiles = []string{"CLAUDE.md", "AGENTS.md", "README.md"}
+
+// maxInstructionBytes caps the concatenated instruction payload (codex's
+// project_doc_max_bytes precedent is 32 KiB): oversized docs would crowd out
+// the working context. The tail is cut on a rune boundary with a marker.
+const maxInstructionBytes = 32 * 1024
 
 // LoadProjectConfig loads configuration from the given project directory.
 // It looks for:
-//   - CLAUDE.md or AGENTS.md in the project root for instructions
+//   - instruction files (CLAUDE.md / AGENTS.md / README.md) layered from the
+//     project root down to projectDir — codex AGENTS.md parity: each
+//     directory contributes its first matching file, concatenated root→cwd
+//     so deeper, more specific instructions land last
 //   - .agentscope/settings.json for structured settings
 //   - .agentscope/settings.local.json for local overrides (merged on top)
 //
@@ -60,17 +70,19 @@ func LoadProjectConfig(projectDir string) (*ProjectConfig, error) {
 		root = projectDir
 	}
 
-	for _, name := range instructionFiles {
-		data, err := os.ReadFile(filepath.Join(root, name))
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("config: read %s: %w", name, err)
-		}
-		cfg.Instructions = string(data)
-		break
+	absDir, err := filepath.Abs(projectDir)
+	if err != nil {
+		absDir = projectDir
 	}
+	// Instructions layer from the VCS root: an instruction file must be
+	// content, not a boundary — a nested CLAUDE.md should stack on the root
+	// one, not replace it. Settings keep using the generic FindProjectRoot
+	// anchor above.
+	instructions, err := loadInstructions(findInstructionRoot(absDir), absDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Instructions = instructions
 
 	configDir := filepath.Join(root, ".agentscope")
 	if fi, err := os.Stat(configDir); err == nil && fi.IsDir() {
@@ -149,4 +161,75 @@ func hasProjectMarker(dir string) bool {
 		}
 	}
 	return false
+}
+
+// findInstructionRoot anchors the instruction layering at the nearest
+// ancestor with a .git entry (codex's default project-root marker). Without
+// one it falls back to FindProjectRoot (.agentscope / instruction-file
+// markers), preserving the pre-layering single-file behavior for marker-less
+// trees.
+func findInstructionRoot(dir string) string {
+	for d := dir; ; {
+		if _, err := os.Stat(filepath.Join(d, ".git")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	if root := FindProjectRoot(dir); root != "" {
+		return root
+	}
+	return dir
+}
+
+// loadInstructions collects instruction files from root down to dir
+// (inclusive), concatenating in root→cwd order with a blank line between
+// layers. A directory contributes its first matching file only. When dir is
+// not under root (or equals it), only the root layer applies — the
+// historical single-file behavior. The total payload is capped at
+// maxInstructionBytes.
+func loadInstructions(root, dir string) (string, error) {
+	chain := []string{root}
+	if rel, err := filepath.Rel(root, dir); err == nil && rel != "." && rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		cur := root
+		for _, part := range strings.Split(rel, string(filepath.Separator)) {
+			cur = filepath.Join(cur, part)
+			chain = append(chain, cur)
+		}
+	}
+
+	var sb strings.Builder
+	for _, dir := range chain {
+		for _, name := range instructionFiles {
+			p := filepath.Join(dir, name)
+			data, err := os.ReadFile(p)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return "", fmt.Errorf("config: read %s: %w", p, err)
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n\n")
+			}
+			sb.Write(data)
+			// One file per directory: deeper fallbacks (e.g. AGENTS.md when
+			// CLAUDE.md exists) do not stack within the same directory.
+			break
+		}
+	}
+
+	out := sb.String()
+	if len(out) > maxInstructionBytes {
+		cut := maxInstructionBytes
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		out = out[:cut] + "\n\n[... instructions truncated at 32 KiB ...]"
+	}
+	return out, nil
 }

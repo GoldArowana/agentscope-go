@@ -224,6 +224,15 @@ The go-sdk dependency (pinned to v1.8.0) is opt-in: only importing
 it. See [the self-contained demo](../examples/mcp_streamable/), which includes
 an in-process spec-compliant server.
 
+MCP servers may also elicit user input in the middle of a tool call. Set
+`ElicitationHandler` on `mcp.StdioConfig` (subprocess servers) or
+`streamablehttp.Config` (Streamable HTTP servers) to declare the capability
+and resolve `elicitation/create` requests through your own UI; the handler
+receives the server's message and requested JSON Schema and answers with
+accept/decline/cancel plus optional form content. Without a handler the
+capability stays undeclared and elicitation requests fail fast with -32601.
+The bare-POST `mcp.HttpClient` has no inbound channel and cannot elicit.
+
 ## Document Parsers (RAG)
 
 The `rag/parser` package converts common file formats into `rag.Document` slices ready for indexing. Each parser supports configurable text chunking with overlap.

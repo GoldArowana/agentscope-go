@@ -19,6 +19,9 @@ func TestHelperFakeMCPServer(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_MCP_SERVER") != "1" {
 		return
 	}
+	// Records whether the client's initialize declared the elicitation
+	// capability, reported by the capcheck tool.
+	sawElicitationCapability := false
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -37,6 +40,11 @@ func TestHelperFakeMCPServer(t *testing.T) {
 		var result any
 		switch req.Method {
 		case "initialize":
+			var ip struct {
+				Capabilities map[string]json.RawMessage `json:"capabilities"`
+			}
+			_ = json.Unmarshal(req.Params, &ip)
+			_, sawElicitationCapability = ip.Capabilities["elicitation"]
 			result = map[string]any{
 				"protocolVersion": "2024-11-05",
 				"capabilities":    map[string]any{},
@@ -63,10 +71,32 @@ func TestHelperFakeMCPServer(t *testing.T) {
 				// Simulate an unresponsive server: never reply.
 				time.Sleep(10 * time.Minute)
 				continue
+			case "capcheck":
+				result = map[string]any{"content": []any{
+					map[string]any{"type": "text", "text": fmt.Sprintf("elicitation-capable:%v", sawElicitationCapability)},
+				}}
+			case "elicit":
+				// Server-initiated traffic mid-call: a notification the
+				// client must ignore, then an elicitation/create request with
+				// a string ID to verify the client echoes it verbatim.
+				fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"about to elicit"}}`)
+				fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"srv-1","method":"elicitation/create","params":{"message":"Need input","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}`)
+				result = map[string]any{"content": []any{
+					map[string]any{"type": "text", "text": "elicit-result:" + readServerRequestResponse(sc)},
+				}}
+			case "unknownreq":
+				// A server request for a method the client does not implement
+				// must fail fast with -32601, not hang this tool call.
+				fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"srv-9","method":"server/bogus","params":{}}`)
+				result = map[string]any{"content": []any{
+					map[string]any{"type": "text", "text": "unknownreq-result:" + readServerRequestResponse(sc)},
+				}}
 			}
-			result = map[string]any{"content": []any{
-				map[string]any{"type": "text", "text": fmt.Sprintf("pid-%d", os.Getpid())},
-			}}
+			if result == nil {
+				result = map[string]any{"content": []any{
+					map[string]any{"type": "text", "text": fmt.Sprintf("pid-%d", os.Getpid())},
+				}}
+			}
 		default:
 			result = map[string]any{}
 		}
@@ -74,6 +104,33 @@ func TestHelperFakeMCPServer(t *testing.T) {
 		fmt.Fprintln(os.Stdout, string(resp))
 	}
 	os.Exit(0)
+}
+
+// readServerRequestResponse reads the client's response to a server-initiated
+// request and summarizes it as "id:<raw> action:<action> name:<name>" for
+// elicitation results or "error:<code>" for error responses.
+func readServerRequestResponse(sc *bufio.Scanner) string {
+	if !sc.Scan() {
+		os.Exit(1)
+	}
+	var resp struct {
+		ID     json.RawMessage `json:"id"`
+		Result struct {
+			Action  string         `json:"action"`
+			Content map[string]any `json:"content"`
+		} `json:"result"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
+		os.Exit(1)
+	}
+	if resp.Error != nil {
+		return fmt.Sprintf("error:%d", resp.Error.Code)
+	}
+	name, _ := resp.Result.Content["name"].(string)
+	return fmt.Sprintf("id:%s action:%s name:%s", string(resp.ID), resp.Result.Action, name)
 }
 
 func fakeMCPServerConfig() *StdioConfig {

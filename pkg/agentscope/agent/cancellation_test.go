@@ -77,7 +77,9 @@ func TestModelCancellationStopsRetryAndFallback(t *testing.T) {
 					if mode == "wrapped_deadline" {
 						return nil, fmt.Errorf("provider: %w", context.DeadlineExceeded)
 					}
-					return nil, errors.New("unavailable")
+					// Retryable wording: only transient errors reach the
+					// cancellable backoff under test.
+					return nil, errors.New("httpx: unexpected status 503: unavailable")
 				}}
 				f := cancellationModel{chat: func(context.Context) (*model.ChatResponse, error) {
 					fallback.Add(1)
@@ -122,7 +124,7 @@ func TestModelRetryAndFallbackSuccess(t *testing.T) {
 				if !useFallback && primaryCalls == 2 {
 					return want, nil
 				}
-				return nil, errors.New("temporary failure")
+				return nil, errors.New("httpx: unexpected status 503: temporary failure")
 			}}
 			fallback := cancellationModel{chat: func(context.Context) (*model.ChatResponse, error) {
 				fallbackCalls++

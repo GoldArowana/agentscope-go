@@ -33,12 +33,60 @@ type Client interface {
 	Close() error
 }
 
+// Elicitation actions for ElicitResponse.Action, per the MCP specification.
+const (
+	// ElicitAccept indicates the user submitted the form/confirmed the action.
+	ElicitAccept = "accept"
+	// ElicitDecline indicates the user explicitly declined the action.
+	ElicitDecline = "decline"
+	// ElicitCancel indicates the user dismissed without making a choice.
+	ElicitCancel = "cancel"
+)
+
+// ElicitRequest carries an MCP elicitation/create request: the server asks
+// the client to prompt the user for information in the middle of a tool
+// call (codex Op::ResolveElicitation parity). Only form-mode elicitation is
+// represented; URL-mode requests arrive with an empty RequestedSchema.
+type ElicitRequest struct {
+	// Message is the human-readable prompt from the server.
+	Message string
+	// RequestedSchema is the JSON Schema for the requested form data, carried
+	// verbatim. Nil when the server did not supply one.
+	RequestedSchema json.RawMessage
+}
+
+// ElicitResponse is the client's answer to an elicitation request.
+type ElicitResponse struct {
+	// Action is one of ElicitAccept, ElicitDecline or ElicitCancel. Any other
+	// value (including the empty string) is normalized to ElicitCancel before
+	// reaching the wire.
+	Action string
+	// Content holds the submitted form data; it is sent to the server only
+	// when Action is ElicitAccept.
+	Content map[string]any
+}
+
+// ElicitationHandler resolves a server-initiated elicitation request, for
+// example by prompting the user and returning their choice. A handler error
+// is reported to the server as a JSON-RPC internal error.
+type ElicitationHandler func(ctx context.Context, req ElicitRequest) (ElicitResponse, error)
+
 // StdioConfig configures a subprocess-based (stdio) MCP connection.
 type StdioConfig struct {
 	Command string
 	Args    []string
 	Env     []string
 	WorkDir string
+
+	// ElicitationHandler, when non-nil, enables MCP elicitation: the client
+	// declares the elicitation capability during initialize and resolves
+	// elicitation/create requests the server sends while a call is in
+	// flight. The handler runs synchronously on the client's wire read loop,
+	// so while it blocks (e.g. waiting on user input) other calls on the
+	// same client cannot proceed. Nil disables elicitation; a server that
+	// still sends elicitation/create receives a -32601 (method not found)
+	// error.
+	ElicitationHandler ElicitationHandler
 
 	// Stateful currently has no implementation (no reader): the subprocess
 	// stays alive across calls until Close regardless of this field.
@@ -51,9 +99,11 @@ type StdioConfig struct {
 // HttpConfig configures an HTTP JSON-RPC MCP connection.
 //
 // The transport is a bare JSON-RPC POST for simple 2024-11-05-era servers:
-// there is no SSE or session support. For the spec Streamable HTTP transport
-// (2025-03-26 and later), use the mcp/streamablehttp subpackage (upstream
-// #2311).
+// there is no SSE or session support, and no inbound channel — server-
+// initiated requests such as elicitation/create cannot arrive, so
+// elicitation is not supported here. For the spec Streamable HTTP transport
+// (2025-03-26 and later), including elicitation support, use the
+// mcp/streamablehttp subpackage (upstream #2311).
 type HttpConfig struct {
 	URL     string
 	Headers map[string]string
@@ -86,6 +136,27 @@ type jsonrpcResponse struct {
 type jsonrpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// jsonrpcEnvelope classifies an inbound line before full decoding: a
+// non-empty Method marks server-initiated traffic (a request when ID is
+// present, a notification otherwise). ID is kept raw because server-chosen
+// request IDs may be strings — unlike client IDs, which are ints — and must
+// be echoed verbatim in the response.
+type jsonrpcEnvelope struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+}
+
+// jsonrpcRawResponse responds to a server-initiated request, echoing the
+// server-chosen ID verbatim.
+type jsonrpcRawResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
+	Error   *jsonrpcError   `json:"error,omitempty"`
 }
 
 // MCP protocol types
