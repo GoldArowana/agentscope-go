@@ -87,6 +87,12 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ### Added
 
+- Experimental `classifier/bailian` for Alibaba Cloud Model Studio System One:
+  typed Binary/Choice/Score decisions, Bailian-specific limits, guarded single
+  HTTP attempts and unknown-usage preservation. Shares an internal wire codec
+  with Jev, retaining Jev's existing API and limits. Includes offline fixtures,
+  executable examples and an opt-in live check; see the [guide](docs/bailian.md)
+  (#69, #16).
 - **Background pre-compression** (`ContextConfig.PrecompressRatio`): when set
   below `TriggerRatio`, the agent starts generating the compaction summary in
   a background goroutine once the estimated context crosses the lower ratio,

@@ -3,7 +3,7 @@
 The experimental `pkg/agentscope/classifier` package evaluates typed questions
 against shared text or a JSON object. It is independent of `model.ChatModel`.
 This guide covers the classifier abstraction merged in [PR #22](https://github.com/agentscope-ai/agentscope-go/pull/22).
-The [Jev adapter](jev.md) and [OpenAI Decisions adapter](openai-decisions.md)
+The [Jev adapter](jev.md), [Bailian adapter](bailian.md) and [OpenAI Decisions adapter](openai-decisions.md)
 implement these contracts in separate subpackages.
 [Fixed-deployment managed execution](managed-task.md) is a separate entry point
 from stage 3 of [issue #16](https://github.com/agentscope-ai/agentscope-go/issues/16).
@@ -127,7 +127,7 @@ parameters and protocol limits are documented in the [Jev guide](jev.md).
 ## Managed dispatch
 
 `classifier.DispatchClassifier` adds `Target` and `ClassifyWithDispatch` for the
-opt-in [managed router](managed-routing.md). Jev, OpenAI Decisions and Fake
+opt-in [managed router](managed-routing.md). Jev, Bailian, OpenAI Decisions and Fake
 implement it. A managed call narrows byte limits through `DispatchLimits` and checks a dispatch guard
 after preparation, immediately before its single dispatch. Guard failure has no
 attempt and preserves its error identity. Ordinary `Classify` stays compatible
