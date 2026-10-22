@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/middleware"
@@ -328,13 +329,50 @@ func TestTruncateToolResult(t *testing.T) {
 			if truncated != tt.wantTrunc {
 				t.Errorf("truncated = %v, want %v", truncated, tt.wantTrunc)
 			}
-			if truncated && !strings.HasSuffix(result, "<<<TRUNCATED>>>") {
-				t.Error("truncated result should end with <<<TRUNCATED>>>")
-			}
 			if !truncated && result != tt.text {
 				t.Error("non-truncated result should equal input")
 			}
 		})
+	}
+}
+
+func TestTruncateToolResultKeepsHeadAndTail(t *testing.T) {
+	head := strings.Repeat("h", 200)
+	middle := strings.Repeat("m", 600)
+	tail := strings.Repeat("t", 200)
+	text := head + middle + tail
+
+	result, truncated := TruncateToolResult(text, 100) // 400-char budget
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if !strings.HasPrefix(result, strings.Repeat("h", 100)) {
+		t.Error("truncated result should keep the head")
+	}
+	if !strings.HasSuffix(result, tail) {
+		t.Error("truncated result should keep the tail")
+	}
+	if !strings.Contains(result, "<<<TRUNCATED:") {
+		t.Error("truncated result should carry an elision marker")
+	}
+	if strings.Contains(result, strings.Repeat("m", 400)) {
+		t.Error("middle content should be elided")
+	}
+}
+
+func TestTruncateToolResultRuneSafe(t *testing.T) {
+	// Multi-byte content must not be cut mid-rune: providers reject invalid
+	// UTF-8 with a 400, which would turn a truncation into a dead reply.
+	text := strings.Repeat("中", 300)                   // 900 bytes, 300 runes
+	result, truncated := TruncateToolResult(text, 100) // 400-byte budget
+	if !truncated {
+		t.Fatal("expected truncation")
+	}
+	if !utf8.ValidString(result) {
+		t.Error("truncated result is not valid UTF-8")
+	}
+	if !strings.HasPrefix(result, "中") || !strings.HasSuffix(result, "中") {
+		t.Error("head and tail should both survive multi-byte truncation")
 	}
 }
 
@@ -498,7 +536,7 @@ func TestCompressContext_ToolResultTruncationInReply(t *testing.T) {
 		for _, b := range m.GetContentBlocks(message.ContentBlockToolResult) {
 			if tr, ok := b.(message.ToolResultBlock); ok && tr.Name == "big_tool" {
 				if output, ok := tr.Output.(string); ok {
-					if strings.HasSuffix(output, "<<<TRUNCATED>>>") {
+					if strings.Contains(output, "<<<TRUNCATED:") {
 						found = true
 					}
 				}

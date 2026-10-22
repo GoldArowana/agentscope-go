@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -58,12 +59,22 @@ func NewTextResponse(text string) *ToolResponse {
 	}
 }
 
-// NewErrorResponse creates a ToolResponse representing an error.
+// NewErrorResponse creates a ToolResponse representing an error. When the
+// error chain contains a *WorkspaceEscapeError the response carries a
+// WorkspaceEscapeInfo under WorkspaceEscapeMetaKey so the agent layer can
+// offer a directory grant instead of surfacing a dead-end failure.
 func NewErrorResponse(err error) *ToolResponse {
-	return &ToolResponse{
+	resp := &ToolResponse{
 		Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: err.Error()}},
 		State:   message.ToolResultError,
 	}
+	var esc *WorkspaceEscapeError
+	if errors.As(err, &esc) {
+		resp.Metadata = map[string]any{
+			WorkspaceEscapeMetaKey: WorkspaceEscapeInfo{Path: esc.Path, Root: esc.Root},
+		}
+	}
+	return resp
 }
 
 // ToolMiddleware wraps individual tool executions in an onion-chain pattern.

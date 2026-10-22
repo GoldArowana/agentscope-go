@@ -315,6 +315,11 @@ func (m *AnthropicChatModel) Chat(ctx context.Context, msgs []*message.Msg, opts
 			OutputTokens:             parsed.Usage.OutputTokens,
 			CacheCreationInputTokens: parsed.Usage.CacheCreationInputTokens,
 			CacheInputTokens:         parsed.Usage.CacheReadInputTokens,
+			// Anthropic's input_tokens excludes cache-read/cache-creation
+			// tokens; the context-window fill level is the sum.
+			TotalInputTokens: parsed.Usage.InputTokens +
+				parsed.Usage.CacheCreationInputTokens +
+				parsed.Usage.CacheReadInputTokens,
 		}
 	}
 
@@ -500,6 +505,7 @@ func processAnthropicStream(ctx context.Context, sseCh <-chan httpx.SSEEvent, ou
 					OutputTokens:             outputTokens,
 					CacheCreationInputTokens: cacheCreationInputTokens,
 					CacheInputTokens:         cacheInputTokens,
+					TotalInputTokens:         inputTokens + cacheCreationInputTokens + cacheInputTokens,
 				},
 				Error: evt.Err,
 			}:
@@ -727,6 +733,7 @@ func processAnthropicStream(ctx context.Context, sseCh <-chan httpx.SSEEvent, ou
 			OutputTokens:             outputTokens,
 			CacheCreationInputTokens: cacheCreationInputTokens,
 			CacheInputTokens:         cacheInputTokens,
+			TotalInputTokens:         inputTokens + cacheCreationInputTokens + cacheInputTokens,
 		}
 	}
 

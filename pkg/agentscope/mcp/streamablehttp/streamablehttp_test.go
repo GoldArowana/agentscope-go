@@ -12,6 +12,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/mcp"
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
 )
 
@@ -84,6 +85,45 @@ func newFixtureServer(t *testing.T, protocolVersions ...string) *httptest.Server
 	}, func(_ context.Context, _ *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
 		return &sdkmcp.CallToolResult{
 			Content: []sdkmcp.Content{&sdkmcp.AudioContent{Data: []byte("wav"), MIMEType: "audio/wav"}},
+		}, nil
+	})
+
+	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, nil)
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// newElicitFixtureServer serves a single tool that elicits a name mid-call
+// and greets with it, so elicitation tests exercise the full server-initiated
+// round trip without touching the shared fixture's tool list.
+func newElicitFixtureServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	server := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "elicit-fixture", Version: "0.1"}, nil)
+	server.AddTool(&sdkmcp.Tool{
+		Name:        "elicit_name",
+		Description: "Elicits a name mid-call and greets with it",
+		InputSchema: map[string]any{"type": "object"},
+	}, func(ctx context.Context, req *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+		res, err := req.Session.Elicit(ctx, &sdkmcp.ElicitParams{
+			Message: "Your name?",
+			RequestedSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+				},
+			},
+		})
+		if err != nil {
+			return &sdkmcp.CallToolResult{
+				Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: "elicit error: " + err.Error()}},
+				IsError: true,
+			}, nil
+		}
+		name, _ := res.Content["name"].(string)
+		return &sdkmcp.CallToolResult{
+			Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: "action:" + res.Action + " name:" + name}},
 		}, nil
 	})
 
@@ -404,5 +444,76 @@ func TestSDKConnectionClosedError(t *testing.T) {
 	}
 	if !errors.Is(err, sdkmcp.ErrConnectionClosed) {
 		t.Errorf("error should wrap sdkmcp.ErrConnectionClosed, got: %v", err)
+	}
+}
+
+// TestElicitation_Accept runs the full server-initiated elicitation round
+// trip: the fixture server elicits mid tools/call, the client-side handler
+// resolves it, and the accepted content reaches the server.
+func TestElicitation_Accept(t *testing.T) {
+	srv := newElicitFixtureServer(t)
+
+	var gotReq mcp.ElicitRequest
+	c := mustClient(t, srv, &Config{
+		ElicitationHandler: func(_ context.Context, req mcp.ElicitRequest) (mcp.ElicitResponse, error) {
+			gotReq = req
+			return mcp.ElicitResponse{
+				Action:  mcp.ElicitAccept,
+				Content: map[string]any{"name": "ada"},
+			}, nil
+		},
+	})
+
+	resp, err := c.CallTool(context.Background(), "elicit_name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, ok := resp.Content[0].(message.TextBlock)
+	if !ok || tb.Text != "action:accept name:ada" {
+		t.Errorf("Content[0] = %+v", resp.Content[0])
+	}
+	if gotReq.Message != "Your name?" {
+		t.Errorf("handler message = %q, want %q", gotReq.Message, "Your name?")
+	}
+	if !strings.Contains(string(gotReq.RequestedSchema), `"name"`) {
+		t.Errorf("handler schema = %s, want it to carry the requested schema", gotReq.RequestedSchema)
+	}
+}
+
+func TestElicitation_Decline(t *testing.T) {
+	srv := newElicitFixtureServer(t)
+	c := mustClient(t, srv, &Config{
+		ElicitationHandler: func(_ context.Context, _ mcp.ElicitRequest) (mcp.ElicitResponse, error) {
+			return mcp.ElicitResponse{Action: mcp.ElicitDecline}, nil
+		},
+	})
+
+	resp, err := c.CallTool(context.Background(), "elicit_name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tb, ok := resp.Content[0].(message.TextBlock)
+	if !ok || tb.Text != "action:decline name:" {
+		t.Errorf("Content[0] = %+v", resp.Content[0])
+	}
+}
+
+// TestElicitation_NoHandler: without a handler the client never declares the
+// capability, and the server's elicitation attempt fails fast instead of
+// hanging the in-flight tool call.
+func TestElicitation_NoHandler(t *testing.T) {
+	srv := newElicitFixtureServer(t)
+	c := mustClient(t, srv, nil)
+
+	resp, err := c.CallTool(context.Background(), "elicit_name", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.State != message.ToolResultError {
+		t.Errorf("State = %q, want error", resp.State)
+	}
+	tb, ok := resp.Content[0].(message.TextBlock)
+	if !ok || !strings.Contains(tb.Text, "elicit error:") {
+		t.Errorf("Content[0] = %+v", resp.Content[0])
 	}
 }

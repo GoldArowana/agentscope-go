@@ -140,9 +140,15 @@ func (c *StdioClient) Reconnect(ctx context.Context) error {
 }
 
 func (c *StdioClient) initialize(ctx context.Context) error {
+	capabilities := map[string]any{}
+	if c.cfg.ElicitationHandler != nil {
+		// Elicitation is capability-gated: declare it so the server knows it
+		// may send elicitation/create while a call is in flight.
+		capabilities["elicitation"] = map[string]any{}
+	}
 	_, err := c.call(ctx, "initialize", initializeParams{
 		ProtocolVersion: "2024-11-05",
-		Capabilities:    map[string]any{},
+		Capabilities:    capabilities,
 		ClientInfo:      clientInfo{Name: "agentscope-go", Version: "2.0"},
 	})
 	if err != nil {
@@ -200,6 +206,19 @@ func (c *StdioClient) call(ctx context.Context, method string, params any) (json
 
 	for sc.Scan() {
 		line := sc.Bytes()
+		var env jsonrpcEnvelope
+		if err := json.Unmarshal(line, &env); err != nil {
+			continue
+		}
+		if env.Method != "" {
+			// Server-initiated traffic: notifications (no id) carry no reply
+			// and are ignored; requests are answered inline so the server's
+			// in-flight tool call can proceed.
+			if len(env.ID) > 0 {
+				c.answerServerRequest(ctx, stdin, &env)
+			}
+			continue
+		}
 		var resp jsonrpcResponse
 		if err := json.Unmarshal(line, &resp); err != nil {
 			continue
@@ -216,6 +235,65 @@ func (c *StdioClient) call(ctx context.Context, method string, params any) (json
 		return nil, fmt.Errorf("mcp stdio: read: %w", err)
 	}
 	return nil, fmt.Errorf("mcp stdio: unexpected end of stream")
+}
+
+// answerServerRequest handles a server-initiated JSON-RPC request that
+// arrives while a call holds the wire mutex. The response echoes the request
+// ID verbatim (server IDs may be strings, unlike client IDs). Unknown
+// methods get -32601 so a server feature the client does not implement fails
+// fast instead of hanging the server's in-flight tool call.
+func (c *StdioClient) answerServerRequest(ctx context.Context, stdin io.Writer, env *jsonrpcEnvelope) {
+	resp := jsonrpcRawResponse{JSONRPC: "2.0", ID: env.ID}
+	switch env.Method {
+	case "elicitation/create":
+		result, rpcErr := c.resolveElicitation(ctx, env.Params)
+		resp.Result = result
+		resp.Error = rpcErr
+	default:
+		resp.Error = &jsonrpcError{Code: -32601, Message: "method not found: " + env.Method}
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		// The shapes above always marshal; drop rather than risk corrupting
+		// the stream with a partial line.
+		return
+	}
+	_, _ = stdin.Write(append(data, '\n'))
+}
+
+// resolveElicitation runs the configured ElicitationHandler for an
+// elicitation/create request. The handler runs synchronously on the wire
+// read loop: while it blocks (e.g. waiting on user input), other calls on
+// this client cannot proceed.
+func (c *StdioClient) resolveElicitation(ctx context.Context, params json.RawMessage) (any, *jsonrpcError) {
+	handler := c.cfg.ElicitationHandler
+	if handler == nil {
+		return nil, &jsonrpcError{Code: -32601, Message: "client does not support elicitation"}
+	}
+	var p struct {
+		Message         string          `json:"message"`
+		RequestedSchema json.RawMessage `json:"requestedSchema"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &jsonrpcError{Code: -32602, Message: "invalid elicitation params: " + err.Error()}
+	}
+	res, err := handler(ctx, ElicitRequest{Message: p.Message, RequestedSchema: p.RequestedSchema})
+	if err != nil {
+		return nil, &jsonrpcError{Code: -32603, Message: "elicitation handler: " + err.Error()}
+	}
+	action := res.Action
+	switch action {
+	case ElicitAccept, ElicitDecline, ElicitCancel:
+	default:
+		// A handler bug must not put an invalid action on the wire; treat it
+		// as a dismissal.
+		action = ElicitCancel
+	}
+	result := map[string]any{"action": action}
+	if action == ElicitAccept && res.Content != nil {
+		result["content"] = res.Content
+	}
+	return result, nil
 }
 
 // ListTools queries the MCP server for available tools.

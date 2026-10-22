@@ -52,6 +52,14 @@ func (a *UnifiedAgent) SaveCheckpoint(ctx context.Context) error {
 	}
 	a.mu.Lock()
 	st := *a.state
+	// Sync permission state from the engine: session-learned rules and
+	// user-granted working directories live there, while a.state.PermissionCtx
+	// only reflects what a checkpoint restore placed in it. SnapshotContext
+	// deep-copies under the engine lock; the lock order here is always
+	// agent.mu -> engine.mu and the engine never calls back into the agent.
+	if a.engine != nil {
+		st.PermissionCtx = a.engine.SnapshotContext()
+	}
 	// Preserve legacy writes for readers that support only schema 1. Recovery
 	// counters require schema 2 and must never silently disappear on downgrade.
 	st.SchemaVersion = 1
@@ -88,6 +96,51 @@ func (a *UnifiedAgent) SaveCheckpoint(ctx context.Context) error {
 		a.state.ReplyRecovery = own.ReplyRecovery
 	}
 	a.mu.Unlock()
+	return nil
+}
+
+// ForkSession branches the current session: it snapshots the live state
+// through the same serialization path as SaveCheckpoint and persists it under
+// newSessionID, leaving the running session (and any existing checkpoint of
+// it) untouched. The fork captures exactly what LoadCheckpoint + WithState
+// restores — context, summary, plan, permission grants and caches — with
+// reply-recovery counters cleared, so the fork starts at a clean reply
+// boundary.
+//
+// Contract: call between replies. Forking mid-reply snapshots whatever
+// partial context the loop has produced so far, which is well-defined but
+// rarely what a caller wants. Returns an error when no StateSaver is
+// configured or newSessionID is empty.
+func (a *UnifiedAgent) ForkSession(ctx context.Context, newSessionID string) error {
+	if newSessionID == "" {
+		return fmt.Errorf("agent: fork session: empty session id")
+	}
+	a.checkpointMu.Lock()
+	defer a.checkpointMu.Unlock()
+	if a.stateSaver == nil {
+		return fmt.Errorf("agent: no StateSaver configured")
+	}
+	a.mu.Lock()
+	st := *a.state
+	if a.engine != nil {
+		st.PermissionCtx = a.engine.SnapshotContext()
+	}
+	a.mu.Unlock()
+	st.SessionID = newSessionID
+	st.ReplyID = ""
+	st.ReplyRecovery = nil
+	st.SchemaVersion = 1
+	raw, err := json.Marshal(&st)
+	if err != nil {
+		return fmt.Errorf("agent: fork marshal: %w", err)
+	}
+	var detached AgentState
+	if err = json.Unmarshal(raw, &detached); err != nil {
+		return fmt.Errorf("agent: fork snapshot: %w", err)
+	}
+	if err = a.stateSaver.SaveState(ctx, newSessionID, &detached); err != nil {
+		return fmt.Errorf("agent: save fork: %w", err)
+	}
 	return nil
 }
 

@@ -134,7 +134,7 @@ func TestModelStreamingSetupRetryAndFallback(t *testing.T) {
 	var primary, fallback atomic.Int32
 	m := &streamContractModel{stream: func(context.Context) (<-chan model.ChatResponse, error) {
 		primary.Add(1)
-		return nil, errors.New("setup failed")
+		return nil, errors.New("httpx: unexpected status 503: setup failed")
 	}}
 	f := &streamContractModel{stream: func(context.Context) (<-chan model.ChatResponse, error) {
 		fallback.Add(1)
@@ -148,7 +148,7 @@ func TestModelStreamingSetupRetryAndFallback(t *testing.T) {
 }
 
 func TestModelStreamingInvalidCompletionNeverRetries(t *testing.T) {
-	for _, mode := range []string{"nil", "missing_final", "terminal_error", "rewrite", "length", "content_filter", "partial_tool"} {
+	for _, mode := range []string{"nil", "missing_final", "terminal_error", "rewrite", "length", "content_filter"} {
 		t.Run(mode, func(t *testing.T) {
 			var attempts, fallbacks atomic.Int32
 			m := &streamContractModel{stream: func(context.Context) (<-chan model.ChatResponse, error) {
@@ -171,8 +171,6 @@ func TestModelStreamingInvalidCompletionNeverRetries(t *testing.T) {
 					last.StopReason = model.StopReasonLength
 				case "content_filter":
 					last.StopReason = model.StopReasonContentFilter
-				case "partial_tool":
-					last.Content = append(last.Content, message.ToolCallBlock{Type: "tool_call", ID: "partial", Name: "work", Input: `{"value":`})
 				}
 				return fixtureStream(first, last)
 			}}

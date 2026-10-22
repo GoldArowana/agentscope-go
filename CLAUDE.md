@@ -55,13 +55,41 @@ agent use cases.
 `UnifiedAgent.ReplyStream` uses `ChatStream` for ordinary rounds and forced
 finalization when model streaming is enabled (the default) and no middleware is
 installed. `agent/model_stream.go` converts text/thinking deltas to events, checks
-final consistency and rejects incomplete streams before tool execution. Legacy
+final consistency and rejects incomplete streams before tool execution. Streams
+that fail before publishing any delta are replayed (bounded, transient errors
+only); streams that fail after publishing, and completed-but-errored responses,
+are terminal. Tool calls with broken streamed arguments are answered with a
+parse-error result instead of failing the reply; nameless calls still fail.
+Provider context-window rejections trigger bounded in-reply recovery (tool-result
+truncation, then forced compaction) instead of failing the reply. Legacy
 middleware chains and `WithModelStreaming(false)` use buffered `callModel`/`Chat`
 so response filters run before publication. `Reply` drains the same event path and
 returns terminal reply errors. `UnifiedAgentRunner.LoopOptions` connects the
 agent to `loop.Loop`; its model adapter still uses buffered `callModel`.
 When changing retries, cancellation, permissions or accounting, trace the
 specific entry point and its adapters rather than assuming they share all hooks.
+
+`agent/conversation.go` adds `Conversation`, an experimental persistent turn
+kernel (codex session/queue parity): `Submit` queues input, injecting it at
+the certified StateReason boundary (where `checkNextAction` has certified no
+tool call awaits its result) so a steered message never splits a
+tool_call/tool_result pair;
+`Interrupt` cancels the turn context — killing in-flight tool processes — and
+retains pending input for the next turn, appending a model-visible marker;
+`Compact` queues compression to the same boundary. Conversation turns emit
+terminal events on the conversation context so an interrupted turn's
+`ReplyEnd` survives cancellation, and steered input is checkpointed before
+the next model call. While a conversation is active, direct
+`Reply`/`ReplyStream`/`ResumeReplyStream` are rejected.
+
+`Conversation.RunUserShellCommand` runs a user-typed shell command outside
+the model loop (codex `!` parity): platform shell with process-group
+isolation, merged output streamed as `user_shell_output` events and a
+`user_shell_end` carrying exit code and duration. It never enters model
+context and bypasses the permission engine by design (the user approved by
+typing it) — never route model-generated commands through it. `Close`
+cancels in-flight commands and waits for their goroutines before closing
+the event stream.
 
 `Middleware` provides reply, reasoning, model-call, acting, system-prompt,
 compression and permission hooks, plus tool registration. `BaseMiddleware`
@@ -82,6 +110,18 @@ Preserve event ordering, terminal events and cancellation-aware sends. Check
 checkpoint schema compatibility and pending-tool state when changing recovery.
 Read [checkpoint tests](pkg/agentscope/agent/checkpoint_test.go) and
 [loop bridge tests](pkg/agentscope/agent/loop_bridge_test.go) for those boundaries.
+
+`UnifiedAgent.ForkSession` branches a session by persisting a checkpoint-fidelity
+snapshot under a new session ID (context, summary, plan and permission grants;
+reply ID and recovery counters cleared). It is a between-replies operation and
+requires a `StateSaver`; run the branch via `LoadCheckpoint` + `WithState`.
+
+Model streams carry an idle guard (`ModelConfig.StreamIdleTimeout`, 5-minute
+default): a silent stream is a transport failure — replayed while unpublished,
+fatal once deltas escaped. Every reply ends with a `turn_stats` custom event
+aggregating model calls, tool calls, iterations and token usage; on the
+middleware swallow path it follows the delivered ReplyEnd, never preceding a
+round that gets swallowed.
 
 The `app` chat handlers register a per-run cancel handle in `ChatRunRegistry`.
 Session cancel also preserves the App's registered background-task cancellation.
@@ -225,6 +265,37 @@ UI's `/compact`), skipping the trigger threshold via an explicit force flag —
 not a zero ratio, which `withDefaults` would normalize away. It is contracted
 for use between replies; see [manual compaction](docs/tools.md#manual-compaction).
 
+`ContextConfig.CompactStrategy` selects the post-compression layout:
+`reserve_tail` (default) keeps the recent messages fitting `ReserveRatio`;
+`fresh_window` folds the history into the summary, keeping at most the
+trailing open tool pair (codex /compact parity). `SummaryMaxTokens` bounds the generated summary (default: window/32
+clamped to [1024, 8192]); over-budget summaries are middle-elided so the
+overview head and next-steps tail survive.
+
+`ContextConfig.PrecompressRatio` (opt-in, must be below `TriggerRatio`)
+moves summarization latency off the reply's critical path: crossing the lower
+ratio starts a background generation from a context snapshot
+([precompress.go](pkg/agentscope/agent/precompress.go)), and the hard trigger
+applies a still-valid result without a blocking model call. Validity is
+structural — same base summary plus the snapshot's boundary message identity
+— so checkpoint rollbacks and interleaved compactions safely discard it; the
+reserved suffix keeps the LIVE message versions so in-place truncation from
+overflow recovery stays in effect. Precompression is off under
+`WithContentBlockCompaction` (the block-level splitter's granularity differs)
+and never retries or truncates on failure — the synchronous path owns that.
+
+`WithPlanTool` registers `update_plan`: the model maintains a step plan
+(at most one `in_progress`) stored in `AgentState.Plan` — checkpointed,
+immune to compression, and re-injected into the model input on every call
+(the compression split accounting counts the injected message). The tool is
+read-only for permission purposes and deliberately NOT concurrency-safe:
+updates are ordered state transitions, and batching would scramble
+last-write-wins against event order. Each successful update emits a
+`plan_updated` custom event. `WithContextRemainingTool` registers
+`get_context_remaining`, reporting the usage-grounded remaining budget as
+`{"tokens_left": N|null}`. Both tools follow the compress_context wiring
+pattern: the tool validates, a callback into the agent mutates state.
+
 ### Tools, permissions and workspace boundaries
 
 Tools implement `tool.Tool`, commonly by embedding `BaseTool`. The toolkit and
@@ -241,6 +312,47 @@ must configure a permission context, consume `ReplyStream` and submit actual use
 answers; the [offline example](examples/ask_user/main.go) deliberately simulates
 those answers. See [the host contract](docs/tools.md#askuser) for limits and errors.
 
+`tool.ShellManager` (with the opt-in `Shell`/`ShellStdin` tools) provides
+persistent shell sessions: one long-running POSIX shell process per named
+session, serialized commands, exit codes via a same-line sentinel (a separate
+sentinel line would be swallowed by stdin-reading commands), head/tail-bounded
+output, and process-group kills on cancellation or `Kill`/`Close`. Sessions
+outlive turns by design; the host owns the manager's lifecycle. `Shell`
+delegates the `Bash` permission pipeline under its own tool name, so learned
+rules stay scoped per tool.
+
+The opt-in `web_search` tool (`tool.NewWebSearchTool`) searches the web
+through a host-injected `SearchFunc`, keeping provider credentials and
+ranking outside the library (no new dependency). It is read-only and
+concurrency-safe; results are ranked title/URL/snippet hits, with `limit`
+defaulting to 5 and capped at 10.
+
+MCP clients support server-initiated elicitation (codex
+`Op::ResolveElicitation` parity): with an `ElicitationHandler` set on
+`mcp.StdioConfig` or `streamablehttp.Config`, the client declares the
+elicitation capability at initialize and resolves `elicitation/create`
+requests mid tool call through the transport-neutral `mcp.ElicitationHandler`
+(`ElicitRequest`/`ElicitResponse`, actions accept/decline/cancel). Stdio
+answers unknown server requests with -32601 and runs the handler on the wire
+read loop (other calls block meanwhile); the bare-POST `HttpClient` has no
+inbound channel and does not support elicitation.
+
+Bash/Shell rule matching is conjunctive across subcommands: a compound command
+is allowed only when EVERY subcommand matches an allow rule
+(`tool.MatchAllSubcommands`), while a deny rule fires when ANY subcommand
+matches (`tool.MatchAnySubcommand`). The engine dispatches through the
+`permission.CompoundRuleMatcher` interface; unparseable commands match no rule
+and degrade to Ask. Learned "always allow" rules persist through
+`permission.RuleStore` (`config.NewSettingsRuleStore` writes
+`.agentscope/settings.local.json`, which `LoadProjectConfig` reads back next
+session); `Engine.AddRulePersistent` refuses to apply a rule its store could
+not durably record.
+
+Project instructions layer codex-style: `LoadProjectConfig` concatenates
+CLAUDE.md/AGENTS.md/README.md (first match per directory) from the `.git`
+root down to the working directory, deeper files last, capped at 32 KiB. An
+instruction file is content, not a project-root boundary.
+
 File and command tools can use a `tool.Backend` from the context.
 `workspace.NewToolBackend` adapts a workspace for use with `tool.WithBackend`.
 When that backend is present, inspect its path and operation semantics instead
@@ -248,7 +360,17 @@ of assuming local OS behavior. Use `path` for workspace-relative paths with
 forward slashes and `filepath` for actual host filesystem paths.
 
 Local file-tool path confinement is opt-in through `tool.WithWorkspaceRoot`;
-it does not provide process or network isolation. Permission modes, an
+it does not provide process or network isolation. Session grants widen the
+jail: when a jailed file tool rejects a path, `tool.NewErrorResponse` tags the
+response with a typed `WorkspaceEscapeInfo` and the agent prompts the user to
+grant the path (an existing path grants itself; a new path grants its parent;
+`grant:dir:` suggested rules), records it in
+`permission.Context.WorkingDirectories` (`Engine.AddWorkingDirectory`), and
+re-executes once with `tool.WithWorkspaceGrants`. Every working directory in
+scope widens the jail on each execution; grants checkpoint with the agent
+state and merge back on resume, but are never written to the rule store.
+Concurrent tool batches cannot prompt (nil event channel) — the escape error
+stands and the model may retry the call alone. Permission modes, an
 orchestrator sandbox policy and a workspace execution backend have different
 responsibilities. A configured policy does not by itself enforce all filesystem,
 network or resource restrictions. Verify each claimed boundary in the relevant

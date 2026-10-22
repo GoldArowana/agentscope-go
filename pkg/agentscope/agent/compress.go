@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
 
@@ -15,6 +16,37 @@ import (
 )
 
 const defaultContextSize = 128000
+
+// defaultToolResultLimit is the default per-tool-result token budget used by
+// ContextConfig.withDefaults and by reactive overflow recovery.
+const defaultToolResultLimit = 50000
+
+// CompactStrategy values for ContextConfig.CompactStrategy.
+const (
+	// CompactStrategyReserveTail keeps the most recent messages fitting
+	// ReserveRatio next to the summary (the default, and the historical
+	// behavior): recent tool results stay directly visible at the cost of a
+	// smaller post-compaction window.
+	CompactStrategyReserveTail = "reserve_tail"
+	// CompactStrategyFreshWindow compresses the ENTIRE history into the
+	// summary and continues with a clean window (codex /compact parity):
+	// maximum room for new work, and no stale tool results competing with
+	// the summary for attention.
+	CompactStrategyFreshWindow = "fresh_window"
+)
+
+// summaryMaxTokens resolves the summary budget: SummaryMaxTokens when set,
+// else window/32 clamped to [1024, 8192]. The clamp keeps tiny windows
+// summarizable and huge windows from producing bloated summaries.
+func summaryMaxTokens(cfg *ContextConfig, ctxSize int) int {
+	if cfg.SummaryMaxTokens > 0 {
+		return cfg.SummaryMaxTokens
+	}
+	if ctxSize <= 0 {
+		return 4096
+	}
+	return min(max(ctxSize/32, 1024), 8192)
+}
 
 var defaultSummarySchema = json.RawMessage(`{
 	"type": "object",
@@ -48,6 +80,10 @@ const defaultCompressionPrompt = "<system-hint>You have been working on the task
 	"Now write a continuation summary that will allow you to resume " +
 	"work efficiently in a future context window where the " +
 	"conversation history will be replaced with this summary. " +
+	"Keep the summary within its token budget: the new window must have " +
+	"room for the actual work. Preserve exact file paths, command lines, " +
+	"identifiers and error messages the next context needs to act without " +
+	"re-discovery; do not paraphrase them into vague prose. " +
 	"Your summary should be structured, concise, and actionable." +
 	"</system-hint>"
 
@@ -82,6 +118,35 @@ type ContextConfig struct {
 	// not already done. 0 (the default) means TriggerRatio/2; values above
 	// TriggerRatio are clamped down to it.
 	AgentDrivenTriggerRatio float64
+
+	// SummaryMaxTokens bounds the generated summary (0 = derived: window/32
+	// clamped to [1024, 8192]). An over-budget summary is middle-elided —
+	// the template keeps the task overview at the head and the next steps
+	// near the tail, so the middle loses the least.
+	SummaryMaxTokens int
+
+	// CompactStrategy selects the window layout after compression:
+	// CompactStrategyReserveTail (default, also "") or
+	// CompactStrategyFreshWindow. See the constants for the trade-off.
+	CompactStrategy string
+
+	// PrecompressRatio, when > 0 and < TriggerRatio, moves the summarization
+	// latency off the critical path: once the estimated context crosses
+	// ContextSize*PrecompressRatio, the agent generates the summary in a
+	// background goroutine from a snapshot of the current context. When the
+	// hard threshold (TriggerRatio) later triggers — or Compact is called —
+	// a still-valid snapshot result is applied instantly instead of blocking
+	// the reply on a summarization call; a stale or missing result falls
+	// back to the synchronous path. The applied summary covers the snapshot
+	// prefix, so messages appended since the snapshot stay raw: precompression
+	// trades a slightly earlier next compaction for hiding the latency.
+	//
+	// 0 (the default) disables precompression; values >= TriggerRatio are
+	// normalized to 0 by withDefaults. Precompression is unavailable with
+	// WithContentBlockCompaction (the block-level splitter has different
+	// granularity) and never runs the overflow retry or truncation fallback —
+	// a failed background generation is simply discarded.
+	PrecompressRatio float64
 }
 
 // agentDrivenTriggerRatio resolves the effective threshold for a
@@ -121,6 +186,11 @@ func (c *ContextConfig) withDefaults() ContextConfig {
 	if cfg.CompressionPrompt == "" {
 		cfg.CompressionPrompt = defaultCompressionPrompt
 	}
+	// Precompression must arm strictly below the hard trigger; a ratio that
+	// cannot fire before it is normalized away entirely.
+	if cfg.PrecompressRatio < 0 || cfg.PrecompressRatio >= cfg.TriggerRatio {
+		cfg.PrecompressRatio = 0
+	}
 	if cfg.SummaryTemplate == "" {
 		cfg.SummaryTemplate = defaultSummaryTemplate
 	}
@@ -128,7 +198,7 @@ func (c *ContextConfig) withDefaults() ContextConfig {
 		cfg.SummarySchema = defaultSummarySchema
 	}
 	if cfg.ToolResultLimit <= 0 {
-		cfg.ToolResultLimit = 50000
+		cfg.ToolResultLimit = defaultToolResultLimit
 	}
 	return cfg
 }
@@ -259,11 +329,24 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 	modelMsgs := a.prepareModelInput(ctx)
 	toolSchemas := a.toolkit.GetToolSchemas()
 	estimatedTokens := a.model.CountTokens(modelMsgs, toolSchemas)
+	// Ground the estimate with the provider's own count from the last
+	// successful call: byte heuristics under-count JSON tool blocks and CJK
+	// text, which delays compression until the provider rejects the request.
+	// Between rounds the context usually only grows, so the last actual count
+	// is a safe lower bound; after a truncation-only overflow recovery it can
+	// over-estimate, which at worst triggers one early compaction.
+	a.mu.Lock()
+	lastActual := a.lastModelInputTokens
+	a.mu.Unlock()
+	if lastActual > estimatedTokens {
+		estimatedTokens = lastActual
+	}
 
 	threshold := int(float64(ctxSize) * cfg.TriggerRatio)
 	// A forced compaction (the exported Compact) skips the threshold check:
 	// the caller has explicitly asked for a summary now.
 	if !force && estimatedTokens < threshold {
+		a.maybeArmPrecompress(ctx, cfg, ctxSize, estimatedTokens)
 		return nil
 	}
 
@@ -286,10 +369,34 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 		"threshold": threshold,
 	}).Info("context compression triggered")
 
+	// A background pre-compression (PrecompressRatio) that already finished
+	// against a still-valid snapshot applies instantly, skipping the blocking
+	// summarization call. Stale or missing results fall through to the
+	// synchronous path.
+	if a.applyReadyPrecompress(ctx) {
+		return nil
+	}
+
 	reserveTokens := int(float64(ctxSize) * cfg.ReserveRatio)
+	if cfg.CompactStrategy == CompactStrategyFreshWindow {
+		// Fresh window: reserve as little as possible. A budget of 1 — NOT 0,
+		// which would take the emergency path — routes the split through the
+		// tool-pair repair machinery, so an in-flight call (e.g. the
+		// compress_context tool call itself when the model drives compaction
+		// mid-turn) is never summarized away from under its pending result;
+		// providers reject an orphan tool_result outright. With nothing in
+		// flight the tail is empty and the window truly starts fresh.
+		reserveTokens = 1
+	}
 	msgsToCompress, msgsToReserve := a.splitContextForCompression(reserveTokens, toolSchemas)
 
 	if len(msgsToCompress) == 0 {
+		if cfg.CompactStrategy == CompactStrategyFreshWindow {
+			// Degenerate counter (messages cost ~0 tokens): nothing can be
+			// split off safely. A no-op beats the zero-reserve fallback,
+			// which would compress in-flight pairs.
+			return nil
+		}
 		logrus.WithField("agent", a.name).Warn("reserve ratio too large, falling back to reserve_ratio=0")
 		msgsToCompress, msgsToReserve = a.splitContextForCompression(0, toolSchemas)
 	}
@@ -351,6 +458,18 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 			Warn("summary formatting failed; falling back to truncation with previous summary")
 		return a.fallbackTruncateKeepSummary(ctx, msgsToCompress, msgsToReserve)
 	}
+	// Enforce the summary budget: a runaway summary silently re-inflates the
+	// window it just freed. Middle-elision keeps the overview head and the
+	// next-steps tail, the two ends the resumed context needs most.
+	if budget := summaryMaxTokens(cfg, ctxSize); budget > 0 {
+		if truncated, did := TruncateToolResult(newSummary, budget); did {
+			logrus.WithFields(logrus.Fields{
+				"agent":  a.name,
+				"budget": budget,
+			}).Warn("summary exceeded budget; middle-elided")
+			newSummary = truncated
+		}
+	}
 
 	// Offload the compressed context to workspace if offloader is set
 	if a.offloader != nil {
@@ -372,6 +491,9 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 	}
 	a.state.Summary = newSummary
 	a.state.Context = msgsToReserve
+	// The actual-usage floor measured the pre-compaction context; keep it
+	// from re-triggering compaction against the shrunken context.
+	a.lastModelInputTokens = 0
 	if a.contentBlockCompaction {
 		a.compactionVersion++
 	}
@@ -389,6 +511,78 @@ func (a *UnifiedAgent) compressContextImpl(ctx context.Context, cfg *ContextConf
 // back to truncation, so the model knows earlier history was dropped
 // (upstream #2140).
 const defaultTruncationNotice = "<system-info>Some earlier messages were truncated for limited context.</system-info>"
+
+// recoverContextOverflow shrinks the context after the provider rejected a
+// request as too large. Cheap, lossless-ish measures run first: oversized
+// tool results are truncated in place (their full content already reached
+// the consumer through events). Only when nothing was truncatable does it
+// force a summarizing compaction, arming a default ContextConfig when the
+// agent never configured one — a dead reply is worse than an unsolicited
+// summary. The caller bounds recovery attempts, so a context that cannot be
+// shrunk below the window still fails.
+func (a *UnifiedAgent) recoverContextOverflow(ctx context.Context) {
+	a.mu.Lock()
+	limit := defaultToolResultLimit
+	ctxSize := 0
+	if a.contextCfg != nil {
+		limit = a.contextCfg.ToolResultLimit
+		ctxSize = a.contextCfg.ContextSize
+	}
+	a.mu.Unlock()
+	if ctxSize <= 0 {
+		ctxSize = model.ResolveContextSize(a.model, defaultContextSize)
+	}
+	// A single result larger than a quarter of the window is an overflow
+	// suspect even when under the (generous) per-result limit.
+	if quarter := ctxSize / 4; quarter < limit {
+		limit = quarter
+	}
+	if limit < 256 {
+		limit = 256
+	}
+	if a.truncateContextToolResults(limit) {
+		logrus.WithField("agent", a.name).Info("context overflow recovered by truncating oversized tool results")
+		return
+	}
+	a.mu.Lock()
+	if a.contextCfg == nil {
+		cfg := (&ContextConfig{}).withDefaults()
+		a.contextCfg = &cfg
+	}
+	a.mu.Unlock()
+	if _, err := a.compressContextWithRatio(ctx, 0, true); err != nil {
+		logrus.WithError(err).WithField("agent", a.name).Warn("forced compaction after context overflow failed")
+	}
+}
+
+// truncateContextToolResults truncates oversized string tool results stored
+// in the conversation context in place. It reports whether anything changed.
+func (a *UnifiedAgent) truncateContextToolResults(limit int) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := false
+	for _, msg := range a.state.Context {
+		if msg == nil {
+			continue
+		}
+		for i, b := range msg.Content {
+			tr, ok := b.(message.ToolResultBlock)
+			if !ok {
+				continue
+			}
+			s, ok := tr.Output.(string)
+			if !ok {
+				continue
+			}
+			if truncated, was := TruncateToolResult(s, limit); was {
+				tr.Output = truncated
+				msg.Content[i] = tr
+				changed = true
+			}
+		}
+	}
+	return changed
+}
 
 // fallbackTruncateKeepSummary resolves a failed compression by truncating
 // the context to the reserve set while keeping the previous summary
@@ -434,6 +628,7 @@ func (a *UnifiedAgent) fallbackTruncateKeepSummary(ctx context.Context, msgsToCo
 	}
 	a.state.Summary = summary
 	a.state.Context = msgsToReserve
+	a.lastModelInputTokens = 0
 	if a.contentBlockCompaction {
 		a.compactionVersion++
 	}
@@ -481,16 +676,37 @@ func (a *UnifiedAgent) splitContextForCompression(reserveTokenBudget int, tools 
 	copy(ctxMsgs, a.state.Context)
 	systemPrompt := a.systemPrompt
 	summary := a.state.Summary
+	plan := a.state.Plan
 	a.mu.Unlock()
 
-	baseMsgs := []*message.Msg{message.SystemMsg(a.name, systemPrompt)}
-	if summary != "" {
-		baseMsgs = append(baseMsgs, message.UserMsg(a.name, "[Previous context summary]: "+summary))
-	}
+	baseMsgs := compressionBaseMsgs(a.name, systemPrompt, summary, plan)
 	if a.contentBlockCompaction {
 		return a.splitContentBlocksForCompression(ctxMsgs, baseMsgs, reserveTokenBudget, tools)
 	}
+	return a.splitMsgsForCompression(ctxMsgs, baseMsgs, reserveTokenBudget, tools)
+}
 
+// compressionBaseMsgs builds the invariant head every compression accounting
+// must charge against: the system prompt, the previous summary (when any)
+// and the plan tracker message prepareModelInput injects on every call —
+// counting it is what keeps the reserve fit and the trigger estimate honest.
+func compressionBaseMsgs(agentName, systemPrompt, summary string, plan []tool.PlanItem) []*message.Msg {
+	baseMsgs := []*message.Msg{message.SystemMsg(agentName, systemPrompt)}
+	if summary != "" {
+		baseMsgs = append(baseMsgs, message.UserMsg(agentName, "[Previous context summary]: "+summary))
+	}
+	if len(plan) > 0 {
+		baseMsgs = append(baseMsgs, planPromptMsg(agentName, plan))
+	}
+	return baseMsgs
+}
+
+// splitMsgsForCompression splits an explicit context snapshot into the
+// prefix to summarize and the reserved suffix, honoring the reserve token
+// budget and tool-pair integrity. The caller owns the snapshot; the agent's
+// live state is not consulted, so the split is safe to run off the reply
+// goroutine (background pre-compression).
+func (a *UnifiedAgent) splitMsgsForCompression(ctxMsgs, baseMsgs []*message.Msg, reserveTokenBudget int, tools []model.ToolSchema) ([]*message.Msg, []*message.Msg) {
 	if reserveTokenBudget <= 0 {
 		// Emergency path (reserve budget disabled, or the retry after a
 		// split that produced nothing): everything is compressed, including
@@ -640,6 +856,12 @@ func pullSplitBackForToolPairs(msgs []*message.Msg, splitIdx int) int {
 
 // TruncateToolResult truncates a tool result string if it exceeds the token limit.
 // Returns the (possibly truncated) text and whether truncation occurred.
+//
+// Truncation keeps the head and tail of the output and elides the middle:
+// shell logs carry their errors at the end while file reads carry their
+// structure at the start, so a pure prefix cut drops exactly the content the
+// model needs. Both cuts land on rune boundaries so the result stays valid
+// UTF-8 (providers reject invalid UTF-8 with a 400).
 func TruncateToolResult(text string, tokenLimit int) (string, bool) {
 	estimatedTokens := len(text) / 4
 	if estimatedTokens <= tokenLimit {
@@ -649,7 +871,30 @@ func TruncateToolResult(text string, tokenLimit int) (string, bool) {
 	if charLimit >= len(text) {
 		return text, false
 	}
-	return text[:charLimit] + "\n<<<TRUNCATED>>>", true
+	truncated, _ := truncateHeadTail(text, charLimit)
+	return truncated, true
+}
+
+// truncateHeadTail keeps the first and last halves of text within charLimit,
+// replacing the elided middle with a byte-count marker. It returns the
+// truncated text and the elided portion ("" when nothing was elided).
+func truncateHeadTail(text string, charLimit int) (truncated, elided string) {
+	if charLimit >= len(text) {
+		return text, ""
+	}
+	head := charLimit / 2
+	for head > 0 && !utf8.RuneStart(text[head]) {
+		head--
+	}
+	tailStart := len(text) - (charLimit - charLimit/2)
+	if tailStart < head {
+		tailStart = head
+	}
+	for tailStart < len(text) && !utf8.RuneStart(text[tailStart]) {
+		tailStart++
+	}
+	elided = text[head:tailStart]
+	return text[:head] + fmt.Sprintf("\n<<<TRUNCATED: %d bytes elided>>>\n", len(elided)) + text[tailStart:], elided
 }
 
 // SplitToolResultForCompression performs token-aware binary search to split
@@ -658,11 +903,18 @@ func TruncateToolResult(text string, tokenLimit int) (string, bool) {
 // Falls back to character-based truncation if no model is available.
 func SplitToolResultForCompression(text string, tokenLimit int, counter TokenCounter) (reserved, offloaded string, wasSplit bool) {
 	if counter == nil {
-		r, split := TruncateToolResult(text, tokenLimit)
-		if split {
-			return r, text[len(r)-len("\n<<<TRUNCATED>>>"):], true
+		if len(text)/4 <= tokenLimit {
+			return text, "", false
 		}
-		return text, "", false
+		charLimit := tokenLimit * 4
+		if charLimit >= len(text) {
+			return text, "", false
+		}
+		cut := charLimit
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		return text[:cut] + "\n<<<TRUNCATED>>>", text[cut:], true
 	}
 
 	probe := []*message.Msg{message.UserMsg("_", text)}

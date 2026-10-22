@@ -14,6 +14,7 @@ import (
 type Engine struct {
 	mu      sync.RWMutex
 	Context *Context
+	store   RuleStore
 }
 
 // NewEngine creates a permission engine with the given context.
@@ -32,6 +33,103 @@ func (e *Engine) AddRule(rule Rule) {
 		e.Context.DenyRules[rule.ToolName] = append(e.Context.DenyRules[rule.ToolName], rule)
 	case BehaviorAsk:
 		e.Context.AskRules[rule.ToolName] = append(e.Context.AskRules[rule.ToolName], rule)
+	}
+}
+
+// SetRuleStore wires durable rule storage. AddRule keeps its in-memory-only
+// behavior for rules loaded from configuration (they must not be written
+// back); AddRulePersistent is the write-through path for rules learned from
+// user approvals.
+func (e *Engine) SetRuleStore(store RuleStore) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.store = store
+}
+
+// AddRulePersistent durably records a learned rule, then applies it in
+// memory. Without a RuleStore it degrades to AddRule. On store failure the
+// rule is NOT applied and the error is returned — the engine never silently
+// keeps a rule the user believes is durable. Callers own the fallback policy:
+// UnifiedAgent logs a warning and applies the rule in memory so the approved
+// action still proceeds this session (fail-open for usability, and safe
+// because the next session simply asks again).
+func (e *Engine) AddRulePersistent(rule Rule) error {
+	e.mu.RLock()
+	store := e.store
+	e.mu.RUnlock()
+	if store == nil {
+		e.AddRule(rule)
+		return nil
+	}
+	if err := store.AppendRule(rule); err != nil {
+		return err
+	}
+	e.AddRule(rule)
+	return nil
+}
+
+// AddWorkingDirectory records dir as part of the permission scope. The agent
+// layer uses it for user-granted workspace-jail escapes; the context is
+// checkpointed with the agent state, so grants survive crash-resume within
+// the session.
+func (e *Engine) AddWorkingDirectory(dir WorkingDirectory) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Context.WorkingDirectories == nil {
+		e.Context.WorkingDirectories = make(map[string]WorkingDirectory)
+	}
+	e.Context.WorkingDirectories[dir.Path] = dir
+}
+
+// GrantedDirectories returns the paths of all working directories in scope
+// (any source), for injection into the file-tool path jail.
+func (e *Engine) GrantedDirectories() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, 0, len(e.Context.WorkingDirectories))
+	for _, d := range e.Context.WorkingDirectories {
+		out = append(out, d.Path)
+	}
+	return out
+}
+
+// SnapshotContext returns a deep copy of the engine's Context, safe to
+// serialize or mutate without holding the engine lock.
+func (e *Engine) SnapshotContext() *Context {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	cp := *e.Context
+	cp.WorkingDirectories = make(map[string]WorkingDirectory, len(e.Context.WorkingDirectories))
+	for k, v := range e.Context.WorkingDirectories {
+		cp.WorkingDirectories[k] = v
+	}
+	copyRules := func(in map[string][]Rule) map[string][]Rule {
+		out := make(map[string][]Rule, len(in))
+		for k, v := range in {
+			out[k] = append([]Rule(nil), v...)
+		}
+		return out
+	}
+	cp.AllowRules = copyRules(e.Context.AllowRules)
+	cp.DenyRules = copyRules(e.Context.DenyRules)
+	cp.AskRules = copyRules(e.Context.AskRules)
+	return &cp
+}
+
+// MergeWorkingDirectories merges restored working directories (e.g. from a
+// checkpoint) into the context without disturbing host-configured rules or
+// the mode. Existing entries win: the host's session configuration is the
+// authority for directories it declared itself.
+func (e *Engine) MergeWorkingDirectories(dirs map[string]WorkingDirectory) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.Context.WorkingDirectories == nil {
+		e.Context.WorkingDirectories = make(map[string]WorkingDirectory, len(dirs))
+	}
+	for k, v := range dirs {
+		if _, exists := e.Context.WorkingDirectories[k]; !exists {
+			e.Context.WorkingDirectories[k] = v
+		}
 	}
 }
 
@@ -252,6 +350,18 @@ func (e *Engine) checkDontAsk(tool Checker, input map[string]any) Decision {
 }
 
 func (e *Engine) checkDenyRules(tool Checker, input map[string]any) *Decision {
+	if rules := e.Context.DenyRules[tool.Name()]; len(rules) > 0 {
+		if cm, ok := tool.(CompoundRuleMatcher); ok {
+			if cm.MatchAnySubcommand(ruleContents(rules), input) {
+				return &Decision{
+					Behavior:       BehaviorDeny,
+					Message:        fmt.Sprintf("Permission to use %s has been denied", tool.Name()),
+					DecisionReason: "Rule: compound subcommand match",
+				}
+			}
+			return nil
+		}
+	}
 	for _, rule := range e.Context.DenyRules[tool.Name()] {
 		if e.ruleMatches(tool, rule, input) {
 			return &Decision{
@@ -265,6 +375,18 @@ func (e *Engine) checkDenyRules(tool Checker, input map[string]any) *Decision {
 }
 
 func (e *Engine) checkAskRules(tool Checker, input map[string]any) *Decision {
+	if rules := e.Context.AskRules[tool.Name()]; len(rules) > 0 {
+		if cm, ok := tool.(CompoundRuleMatcher); ok {
+			if cm.MatchAnySubcommand(ruleContents(rules), input) {
+				return &Decision{
+					Behavior:       BehaviorAsk,
+					Message:        fmt.Sprintf("Permission required for %s", tool.Name()),
+					DecisionReason: "Rule: compound subcommand match",
+				}
+			}
+			return nil
+		}
+	}
 	for _, rule := range e.Context.AskRules[tool.Name()] {
 		if e.ruleMatches(tool, rule, input) {
 			return &Decision{
@@ -278,6 +400,18 @@ func (e *Engine) checkAskRules(tool Checker, input map[string]any) *Decision {
 }
 
 func (e *Engine) checkAllowRules(tool Checker, input map[string]any) *Decision {
+	if rules := e.Context.AllowRules[tool.Name()]; len(rules) > 0 {
+		if cm, ok := tool.(CompoundRuleMatcher); ok {
+			if cm.MatchAllSubcommands(ruleContents(rules), input) {
+				return &Decision{
+					Behavior:     BehaviorAllow,
+					Message:      fmt.Sprintf("Permission granted for %s", tool.Name()),
+					UpdatedInput: input,
+				}
+			}
+			return nil
+		}
+	}
 	for _, rule := range e.Context.AllowRules[tool.Name()] {
 		if e.ruleMatches(tool, rule, input) {
 			return &Decision{
@@ -295,6 +429,16 @@ func (e *Engine) ruleMatches(tool Checker, rule Rule, input map[string]any) bool
 		return true
 	}
 	return tool.MatchRule(rule.RuleContent, input)
+}
+
+// ruleContents flattens rules to their content patterns for
+// CompoundRuleMatcher tools.
+func ruleContents(rules []Rule) []string {
+	contents := make([]string, len(rules))
+	for i, r := range rules {
+		contents[i] = r.RuleContent
+	}
+	return contents
 }
 
 func (e *Engine) generateSuggestions(tool Checker, input map[string]any) []Rule {

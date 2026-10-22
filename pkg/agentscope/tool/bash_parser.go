@@ -529,6 +529,62 @@ func ExtractCommandPrefixes(cmd string, max int) []string {
 	return prefixes
 }
 
+// collectSubcommandTexts returns the source text of every simple command in a
+// compound command, including commands inside $(...) and backquote
+// substitutions (syntax.Walk descends into them). The boolean is false when
+// the command does not parse — callers must fail safe (no rule matches).
+func collectSubcommandTexts(cmd string) ([]string, bool) {
+	f, err := parseBashAST(cmd)
+	if err != nil {
+		return nil, false
+	}
+	src := []byte(cmd)
+	seen := make(map[string]bool)
+	var texts []string
+	syntax.Walk(f, func(node syntax.Node) bool {
+		callExpr, ok := node.(*syntax.CallExpr)
+		if !ok {
+			return true
+		}
+		// A pure assignment (X=1) is not a command; skip it. Its value's
+		// $(...)/`...` substitutions are still walked as their own call
+		// expressions, so nothing inside escapes rule matching.
+		if len(callExpr.Args) == 0 {
+			return true
+		}
+		// Start at the first argument, not the call: mvdan/sh spans leading
+		// env assignments into the CallExpr range, and leaving them in the
+		// matched text lets "X=1 hostname -f" slip past a "hostname:*" rule.
+		posNode := syntax.Node(callExpr.Args[0])
+		pos, end := int(posNode.Pos().Offset()), int(callExpr.End().Offset())
+		if pos < 0 || end > len(src) || pos >= end {
+			return true
+		}
+		text := strings.TrimSpace(string(src[pos:end]))
+		if text != "" && !seen[text] {
+			seen[text] = true
+			texts = append(texts, text)
+		}
+		return true
+	})
+	if len(texts) == 0 {
+		// No simple commands (e.g. bare assignments): treat the whole input
+		// as one unit so rules can still match it.
+		texts = append(texts, strings.TrimSpace(cmd))
+	}
+	return texts, true
+}
+
+// matchSingleCommandRule applies one anchored glob rule to one simple command.
+func matchSingleCommandRule(ruleContent, cmd string) bool {
+	pattern := ruleToRegex(ruleContent)
+	re, err := regexp.Compile("^" + pattern + "$")
+	if err != nil {
+		return strings.Contains(cmd, ruleContent)
+	}
+	return re.MatchString(cmd)
+}
+
 // sedAllowedFlags is the set of sed flags that are safe to use.
 var sedAllowedFlags = map[string]bool{
 	"-e": true, "-n": true, "--quiet": true, "--silent": true,

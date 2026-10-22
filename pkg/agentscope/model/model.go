@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -108,6 +109,24 @@ type ChatUsage struct {
 	Time                     float64 `json:"time,omitempty"` // seconds
 	CacheCreationInputTokens int     `json:"cache_creation_input_tokens,omitempty"`
 	CacheInputTokens         int     `json:"cache_input_tokens,omitempty"`
+
+	// TotalInputTokens is the provider-reported total prompt size in tokens,
+	// including any cached portions. Cache accounting differs per provider:
+	// Anthropic's InputTokens excludes cache-read/cache-creation tokens while
+	// OpenAI-style prompt_tokens includes them. Adapters that report
+	// non-inclusive InputTokens set this field so consumers (e.g. the
+	// compression trigger) can use the real context fill level. Zero means
+	// InputTokens already represents the total.
+	TotalInputTokens int `json:"total_input_tokens,omitempty"`
+}
+
+// EffectiveInputTokens returns TotalInputTokens when the adapter reported it,
+// falling back to InputTokens otherwise.
+func (u ChatUsage) EffectiveInputTokens() int {
+	if u.TotalInputTokens > 0 {
+		return u.TotalInputTokens
+	}
+	return u.InputTokens
 }
 
 // ToolSchema defines a tool for model API function calling.
@@ -366,6 +385,51 @@ func IsRetryableError(err error) bool {
 	s := err.Error()
 	for _, pattern := range []string{"429", "rate limit", "timeout", "connection reset", "connection refused", "500", "502", "503", "overloaded"} {
 		if contains(s, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// contextLimitExceededPatterns are lowercased provider wordings for "the
+// request is larger than the model's context window". Providers report this
+// through heterogeneous HTTP 400/413 payloads, so detection is textual.
+// Rate-limit and quota wordings are deliberately absent: a "tokens per
+// minute" rejection is transient, not a context overflow.
+var contextLimitExceededPatterns = []string{
+	"context_length_exceeded",              // OpenAI error code
+	"maximum context length",               // OpenAI/DeepSeek message
+	"prompt is too long",                   // Anthropic
+	"prompt too long",                      // proxies
+	"context window exceeded",              // generic
+	"input length exceeds",                 // Ollama
+	"exceeds the context length",           // Ollama variants
+	"exceeds the maximum number of tokens", // Gemini
+	"exceeded model token limit",           // Moonshot/Kimi
+	"range of input length",                // DashScope
+	"request entity too large",             // HTTP 413 body wording
+	"status 413",                           // httpx status line
+	"input is too long",                    // generic
+	"context size exceeded",                // local backends
+	"reduce the length of the messages",    // OpenAI closing sentence
+}
+
+// IsContextLimitExceeded reports whether err indicates the provider rejected
+// the request because the input exceeded the model's context window. It first
+// honors the typed errors.ErrModelContextLimit sentinel, then falls back to
+// the documented provider wordings. Callers typically recover by compacting
+// the conversation and retrying; a false positive costs one unnecessary
+// compaction, a false negative costs a failed model call.
+func IsContextLimitExceeded(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, aserr.ErrModelContextLimit) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, pattern := range contextLimitExceededPatterns {
+		if strings.Contains(s, pattern) {
 			return true
 		}
 	}

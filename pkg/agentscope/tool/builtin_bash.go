@@ -483,22 +483,64 @@ func (t *bashTool) MatchRule(ruleContent string, input map[string]any) bool {
 	if ruleContent == "" {
 		return true
 	}
-
 	cmdStr, _ := input["command"].(string)
 	cmdStr = strings.TrimSpace(cmdStr)
 	if cmdStr == "" {
 		return false
 	}
+	return t.MatchAllSubcommands([]string{ruleContent}, input)
+}
 
-	// Convert glob-like rule to regex
-	pattern := ruleToRegex(ruleContent)
-	re, err := regexp.Compile("^" + pattern + "$")
-	if err != nil {
-		// Fallback to substring matching
-		return strings.Contains(cmdStr, ruleContent)
+// MatchAllSubcommands implements permission.CompoundRuleMatcher for allow
+// rules: a compound command is allowed only when EVERY simple subcommand —
+// including command substitutions — matches at least one allow rule. This
+// closes the classic bypass where "git status && <anything>" rode on an
+// allowed "git status:*" prefix. Unparseable commands fail safe (no match).
+func (t *bashTool) MatchAllSubcommands(rules []string, input map[string]any) bool {
+	cmdStr, _ := input["command"].(string)
+	cmdStr = strings.TrimSpace(cmdStr)
+	if cmdStr == "" {
+		return false
 	}
+	subs, ok := collectSubcommandTexts(cmdStr)
+	if !ok {
+		return false
+	}
+	for _, sub := range subs {
+		matched := false
+		for _, rule := range rules {
+			if rule == "" || matchSingleCommandRule(rule, sub) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
 
-	return re.MatchString(cmdStr)
+// MatchAnySubcommand implements permission.CompoundRuleMatcher for deny/ask
+// rules: a compound command matches when ANY subcommand matches ANY rule.
+func (t *bashTool) MatchAnySubcommand(rules []string, input map[string]any) bool {
+	cmdStr, _ := input["command"].(string)
+	cmdStr = strings.TrimSpace(cmdStr)
+	if cmdStr == "" {
+		return false
+	}
+	subs, ok := collectSubcommandTexts(cmdStr)
+	if !ok {
+		return false
+	}
+	for _, sub := range subs {
+		for _, rule := range rules {
+			if rule == "" || matchSingleCommandRule(rule, sub) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GenerateSuggestions produces permission rule suggestions based on command prefixes.
