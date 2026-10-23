@@ -219,24 +219,15 @@ func (f *AnthropicFormatter) Format(msgs []*message.Msg) ([]map[string]any, erro
 		if msg.Role == message.RoleSystem {
 			continue
 		}
-		result = append(result, f.expandMsg(msg)...)
+		formatted := f.formatMsg(msg)
+		if formatted != nil {
+			result = append(result, formatted)
+		}
 	}
 	return result, nil
 }
 
-// expandMsg formats one internal message as ordered wire messages. Agents may
-// merge a whole tool round into a single assistant message (thinking, text,
-// tool_use and tool_result blocks interleaved), but the Anthropic Messages
-// API only accepts tool_result blocks in USER messages — an assistant message
-// carrying them is wire-invalid (strict endpoints reject it; lenient proxies
-// accept it but the model never sees the results). The expansion walks the
-// blocks in order, flushing whenever the wire role changes, so a merged
-// round becomes [assistant(...tool_use), user(tool_result...)] pairs with
-// every result after its call.
-func (f *AnthropicFormatter) expandMsg(msg *message.Msg) []map[string]any {
-	if msg == nil {
-		return nil
-	}
+func (f *AnthropicFormatter) formatMsg(msg *message.Msg) map[string]any {
 	role := string(msg.Role)
 	if role == "tool" {
 		role = "user"
@@ -247,114 +238,80 @@ func (f *AnthropicFormatter) expandMsg(msg *message.Msg) []map[string]any {
 		return nil
 	}
 
-	var (
-		out      []map[string]any
-		curRole  string
-		content  []map[string]any
-	)
-	flush := func() {
-		if len(content) == 0 {
-			return
-		}
-		out = append(out, map[string]any{"role": curRole, "content": content})
-		content = nil
-	}
-	appendBlock := func(targetRole string, block map[string]any) {
-		if block == nil {
-			return
-		}
-		if curRole == "" {
-			curRole = targetRole
-		}
-		if targetRole != curRole {
-			flush()
-			curRole = targetRole
-		}
-		content = append(content, block)
-	}
-
+	var content []map[string]any
 	for _, b := range blocks {
-		// tool_result blocks always belong to a user message; everything
-		// else keeps the message's own (possibly remapped) role.
-		_, isToolResult := b.(message.ToolResultBlock)
-		blockRole := role
-		if isToolResult {
-			blockRole = "user"
-		}
-		for _, formatted := range f.formatBlock(b) {
-			appendBlock(blockRole, formatted)
-		}
-	}
-	flush()
-	return out
-}
-
-// formatBlock renders one content block in the Anthropic wire format.
-func (f *AnthropicFormatter) formatBlock(b message.ContentBlock) []map[string]any {
-	switch blk := b.(type) {
-	case message.TextBlock:
-		if blk.Text == "" {
-			return nil
-		}
-		return []map[string]any{{"type": "text", "text": blk.Text}}
-	case message.ThinkingBlock:
-		if blk.Thinking == "" {
-			return nil
-		}
-		tb := map[string]any{
-			"type":     "thinking",
-			"thinking": blk.Thinking,
-		}
-		if sig, ok := blk.Extra["signature"]; ok && sig != "" {
-			tb["signature"] = sig
-		}
-		return []map[string]any{tb}
-	case message.RedactedThinkingBlock:
-		rtb := map[string]any{
-			"type": "redacted_thinking",
-		}
-		if blk.Data != "" {
-			rtb["data"] = blk.Data
-		}
-		return []map[string]any{rtb}
-	case message.ToolCallBlock:
-		inputObj := jsonLoadsWithRepair(blk.Input)
-		return []map[string]any{{
-			"type":  "tool_use",
-			"id":    blk.ID,
-			"name":  blk.Name,
-			"input": inputObj,
-		}}
-	case message.ToolResultBlock:
-		resultText := ConvertToolResultToString(blk.Output)
-		if resultText == "" {
-			resultText = "(empty tool output)"
-		}
-		return []map[string]any{{
-			"type":        "tool_result",
-			"tool_use_id": blk.ID,
-			"content":     resultText,
-		}}
-	case message.HintBlock:
-		var out []map[string]any
-		for _, sub := range hintContent(blk) {
-			switch h := sub.(type) {
-			case message.TextBlock:
-				out = append(out, map[string]any{"type": "text", "text": h.Text})
-			case message.DataBlock:
-				if formatted := f.formatAnthropicDataBlock(h); formatted != nil {
-					out = append(out, formatted)
+		switch blk := b.(type) {
+		case message.TextBlock:
+			if blk.Text != "" {
+				content = append(content, map[string]any{
+					"type": "text",
+					"text": blk.Text,
+				})
+			}
+		case message.ThinkingBlock:
+			if blk.Thinking != "" {
+				tb := map[string]any{
+					"type":     "thinking",
+					"thinking": blk.Thinking,
+				}
+				if sig, ok := blk.Extra["signature"]; ok && sig != "" {
+					tb["signature"] = sig
+				}
+				content = append(content, tb)
+			}
+		case message.RedactedThinkingBlock:
+			rtb := map[string]any{
+				"type": "redacted_thinking",
+			}
+			if blk.Data != "" {
+				rtb["data"] = blk.Data
+			}
+			content = append(content, rtb)
+		case message.ToolCallBlock:
+			inputObj := jsonLoadsWithRepair(blk.Input)
+			content = append(content, map[string]any{
+				"type":  "tool_use",
+				"id":    blk.ID,
+				"name":  blk.Name,
+				"input": inputObj,
+			})
+		case message.ToolResultBlock:
+			resultText := ConvertToolResultToString(blk.Output)
+			if resultText == "" {
+				resultText = "(empty tool output)"
+			}
+			trBlock := map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": blk.ID,
+				"content":     resultText,
+			}
+			content = append(content, trBlock)
+		case message.HintBlock:
+			for _, sub := range hintContent(blk) {
+				switch h := sub.(type) {
+				case message.TextBlock:
+					content = append(content, map[string]any{"type": "text", "text": h.Text})
+				case message.DataBlock:
+					if formatted := f.formatAnthropicDataBlock(h); formatted != nil {
+						content = append(content, formatted)
+					}
 				}
 			}
+		case message.DataBlock:
+			if formatted := f.formatAnthropicDataBlock(blk); formatted != nil {
+				content = append(content, formatted)
+			}
 		}
-		return out
-	case message.DataBlock:
-		if formatted := f.formatAnthropicDataBlock(blk); formatted != nil {
-			return []map[string]any{formatted}
-		}
+	}
+
+	if len(content) == 0 {
 		return nil
 	}
-	return nil
+
+	return map[string]any{
+		"role":    role,
+		"content": content,
+	}
 }
 
 func (f *AnthropicFormatter) formatAnthropicDataBlock(blk message.DataBlock) map[string]any {
@@ -392,23 +349,20 @@ func (f *AnthropicFormatter) FormatMultiAgent(msgs []*message.Msg, currentAgent 
 		if msg == nil || msg.Role == message.RoleSystem {
 			continue
 		}
-		expanded := f.expandMsg(msg)
-		if len(expanded) == 0 {
+		m := f.formatMsg(msg)
+		if m == nil {
 			continue
 		}
-		if msg.Name != "" && msg.Name != currentAgent {
-			// Prepend the sender name to the first wire message of the
-			// expansion (the message's own role).
-			if m := expanded[0]; m != nil {
-				if role, _ := m["role"].(string); role == "user" || role == "assistant" {
-					if content, ok := m["content"].([]map[string]any); ok && len(content) > 0 {
-						nameBlock := map[string]any{"type": "text", "text": "[" + msg.Name + "]:"}
-						m["content"] = append([]map[string]any{nameBlock}, content...)
-					}
+		role, _ := m["role"].(string)
+		if role == "user" || role == "assistant" {
+			if msg.Name != "" && msg.Name != currentAgent {
+				if content, ok := m["content"].([]map[string]any); ok && len(content) > 0 {
+					nameBlock := map[string]any{"type": "text", "text": "[" + msg.Name + "]:"}
+					m["content"] = append([]map[string]any{nameBlock}, content...)
 				}
 			}
 		}
-		formatted = append(formatted, expanded...)
+		formatted = append(formatted, m)
 	}
 
 	return formatted, nil
