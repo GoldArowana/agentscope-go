@@ -402,6 +402,12 @@ func convertToolResult(result toolCallResult) *tool.ToolResponse {
 		}
 	}
 
+	// Mirror upstream AgentScope: when a result carries structuredContent
+	// without any text block, surface it as JSON text instead of dropping it.
+	if text := structuredText(result.StructuredContent); text != "" && !hasTextBlock(blocks) {
+		blocks = append(blocks, message.TextBlock{Type: "text", Text: text})
+	}
+
 	state := message.ToolResultSuccess
 	if result.IsError {
 		state = message.ToolResultError
@@ -414,4 +420,23 @@ func convertToolResult(result toolCallResult) *tool.ToolResponse {
 		Content: blocks,
 		State:   state,
 	}
+}
+
+// structuredText returns the wire JSON of a structuredContent field, or ""
+// when the field is absent or null.
+func structuredText(raw json.RawMessage) string {
+	s := string(raw)
+	if s == "" || s == "null" {
+		return ""
+	}
+	return s
+}
+
+func hasTextBlock(blocks []message.ContentBlock) bool {
+	for _, b := range blocks {
+		if _, ok := b.(message.TextBlock); ok {
+			return true
+		}
+	}
+	return false
 }
