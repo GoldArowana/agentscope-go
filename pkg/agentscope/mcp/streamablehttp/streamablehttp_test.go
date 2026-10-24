@@ -109,6 +109,17 @@ func newFixtureServer(t *testing.T, protocolVersions ...string) *httptest.Server
 		}, nil
 	})
 
+	server.AddTool(&sdkmcp.Tool{
+		Name:        "structured_audio_tool",
+		Description: "Returns audio plus structured content",
+		InputSchema: map[string]any{"type": "object"},
+	}, func(_ context.Context, _ *sdkmcp.CallToolRequest) (*sdkmcp.CallToolResult, error) {
+		return &sdkmcp.CallToolResult{
+			Content:           []sdkmcp.Content{&sdkmcp.AudioContent{Data: []byte("wav"), MIMEType: "audio/wav"}},
+			StructuredContent: map[string]any{"transcript": "hi"},
+		}, nil
+	})
+
 	handler := sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server { return server }, nil)
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -184,8 +195,8 @@ func TestListTools_Mapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(schemas) != 6 {
-		t.Fatalf("got %d tools, want 6", len(schemas))
+	if len(schemas) != 7 {
+		t.Fatalf("got %d tools, want 7", len(schemas))
 	}
 
 	var found bool
@@ -358,6 +369,33 @@ func TestCallTool_StructuredContentSkippedWhenTextPresent(t *testing.T) {
 	tb, ok := resp.Content[0].(message.TextBlock)
 	if !ok || tb.Text != "22C in Beijing" {
 		t.Errorf("Content[0] = %+v", resp.Content[0])
+	}
+}
+
+// TestCallTool_StructuredContentWithAudioOnly proves non-text content does
+// not suppress the structured fallback: audio plus structured content yields
+// the textified audio block and the structured JSON text.
+func TestCallTool_StructuredContentWithAudioOnly(t *testing.T) {
+	srv := newFixtureServer(t)
+	c := mustClient(t, srv, nil)
+
+	resp, err := c.CallTool(context.Background(), "structured_audio_tool", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 2 {
+		t.Fatalf("Content = %+v, want audio text plus structured fallback", resp.Content)
+	}
+	tb, ok := resp.Content[1].(message.TextBlock)
+	if !ok {
+		t.Fatalf("Content[1] = %T, want TextBlock", resp.Content[1])
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(tb.Text), &decoded); err != nil {
+		t.Fatalf("fallback text is not JSON: %v", err)
+	}
+	if decoded["transcript"] != "hi" {
+		t.Errorf("decoded = %+v, want the structured payload", decoded)
 	}
 }
 

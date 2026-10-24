@@ -176,12 +176,15 @@ func (c *Client) CallTool(ctx context.Context, name string, input map[string]any
 // convertResult maps an SDK tool result to a ToolResponse, mirroring the
 // StdioClient conversion: text and image content blocks, IsError to the
 // result state, and a guaranteed non-empty block list. Structured content
-// without any text block is surfaced as JSON text instead of being dropped.
+// without any wire text content is surfaced as JSON text instead of being
+// dropped.
 func convertResult(result *sdkmcp.CallToolResult) *tool.ToolResponse {
 	var blocks []message.ContentBlock
+	hasText := false
 	for _, content := range result.Content {
 		switch c := content.(type) {
 		case *sdkmcp.TextContent:
+			hasText = true
 			blocks = append(blocks, message.TextBlock{Type: "text", Text: c.Text})
 		case *sdkmcp.ImageContent:
 			// The SDK decodes the wire base64 into raw bytes; Base64Source
@@ -203,7 +206,7 @@ func convertResult(result *sdkmcp.CallToolResult) *tool.ToolResponse {
 		}
 	}
 
-	if result.StructuredContent != nil && !hasTextBlock(blocks) {
+	if result.StructuredContent != nil && !hasText {
 		if text := marshalStructured(result.StructuredContent); text != "" {
 			blocks = append(blocks, message.TextBlock{Type: "text", Text: text})
 		}
@@ -217,15 +220,6 @@ func convertResult(result *sdkmcp.CallToolResult) *tool.ToolResponse {
 		blocks = []message.ContentBlock{message.TextBlock{Type: "text", Text: ""}}
 	}
 	return &tool.ToolResponse{Content: blocks, State: state}
-}
-
-func hasTextBlock(blocks []message.ContentBlock) bool {
-	for _, b := range blocks {
-		if _, ok := b.(message.TextBlock); ok {
-			return true
-		}
-	}
-	return false
 }
 
 // marshalStructured renders structured content as JSON without HTML escaping,

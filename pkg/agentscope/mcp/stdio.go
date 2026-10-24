@@ -384,7 +384,11 @@ func convertToolSchemas(tools []mcpTool) []model.ToolSchema {
 
 func convertToolResult(result toolCallResult) *tool.ToolResponse {
 	var blocks []message.ContentBlock
+	hasText := false
 	for _, c := range result.Content {
+		if c.Type == "text" {
+			hasText = true
+		}
 		switch c.Type {
 		case "text":
 			blocks = append(blocks, message.TextBlock{Type: "text", Text: c.Text})
@@ -403,8 +407,11 @@ func convertToolResult(result toolCallResult) *tool.ToolResponse {
 	}
 
 	// Mirror upstream AgentScope: when a result carries structuredContent
-	// without any text block, surface it as JSON text instead of dropping it.
-	if text := structuredText(result.StructuredContent); text != "" && !hasTextBlock(blocks) {
+	// without any wire text content, surface it as JSON text instead of
+	// dropping it. The check uses the wire types, not the converted blocks:
+	// unknown types (audio, resources) are textified above, and counting
+	// those would still drop the structured payload.
+	if text := structuredText(result.StructuredContent); text != "" && !hasText {
 		blocks = append(blocks, message.TextBlock{Type: "text", Text: text})
 	}
 
@@ -430,13 +437,4 @@ func structuredText(raw json.RawMessage) string {
 		return ""
 	}
 	return s
-}
-
-func hasTextBlock(blocks []message.ContentBlock) bool {
-	for _, b := range blocks {
-		if _, ok := b.(message.TextBlock); ok {
-			return true
-		}
-	}
-	return false
 }

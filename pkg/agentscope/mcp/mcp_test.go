@@ -235,6 +235,24 @@ func TestConvertToolResult_StructuredContentErrorState(t *testing.T) {
 	}
 }
 
+func TestConvertToolResult_StructuredContentWithAudioOnly(t *testing.T) {
+	result := toolCallResult{
+		Content:           []mcpContent{{Type: "audio", Data: "aGk=", MimeType: "audio/wav"}},
+		StructuredContent: json.RawMessage(`{"transcript":"hi"}`),
+	}
+
+	resp := convertToolResult(result)
+	// The audio block is textified by the default branch; the structured
+	// payload must still surface as JSON text.
+	if len(resp.Content) != 2 {
+		t.Fatalf("content len = %d, want audio placeholder plus structured fallback", len(resp.Content))
+	}
+	tb, ok := resp.Content[1].(message.TextBlock)
+	if !ok || tb.Text != `{"transcript":"hi"}` {
+		t.Errorf("content[1] = %+v, want structured JSON text", resp.Content[1])
+	}
+}
+
 func TestMCPTool_Execute(t *testing.T) {
 	mock := &mockMCPClient{
 		result: tool.NewTextResponse("mock result"),
