@@ -88,14 +88,15 @@ func convToolCall(id, name string) *model.ChatResponse {
 // canceled.
 type gatedTool struct {
 	tool.BaseTool
-	started   chan struct{}
-	gate      chan struct{}
-	once      sync.Once
-	sawCancel atomic.Bool
+	started    chan struct{}
+	gate       chan struct{}
+	canceled   chan struct{}
+	once       sync.Once
+	cancelOnce sync.Once
 }
 
 func newGatedTool(name string) *gatedTool {
-	t := &gatedTool{started: make(chan struct{}), gate: make(chan struct{})}
+	t := &gatedTool{started: make(chan struct{}), gate: make(chan struct{}), canceled: make(chan struct{})}
 	t.ToolName = name
 	t.ToolDescription = "test gate"
 	t.ToolSchema = json.RawMessage(`{"type":"object","properties":{}}`)
@@ -108,8 +109,22 @@ func (t *gatedTool) Execute(ctx context.Context, _ map[string]any) (*tool.ToolRe
 	case <-t.gate:
 		return tool.NewTextResponse("gate released"), nil
 	case <-ctx.Done():
-		t.sawCancel.Store(true)
+		t.cancelOnce.Do(func() { close(t.canceled) })
 		return nil, ctx.Err()
+	}
+}
+
+// waitToolCanceled fails unless the gate tool observes cancellation. The
+// observation lands in the tool goroutine, which is not joined by the turn
+// unwind path (the forwarder can close the reply channel early on
+// cancellation), so it can trail Close/Interrupt — poll with a deadline
+// instead of asserting synchronously.
+func waitToolCanceled(t *testing.T, gate *gatedTool, msg string) {
+	t.Helper()
+	select {
+	case <-gate.canceled:
+	case <-time.After(10 * time.Second):
+		t.Fatal(msg)
 	}
 }
 
@@ -368,9 +383,7 @@ func TestConversationInterruptDeliversTerminalEvents(t *testing.T) {
 	if end.FinishedReason != types.ReplyInterrupted {
 		t.Fatalf("reason = %v, want interrupted", end.FinishedReason)
 	}
-	if !gate.sawCancel.Load() {
-		t.Fatal("running tool was not canceled")
-	}
+	waitToolCanceled(t, gate, "running tool was not canceled")
 
 	// Model-visible marker follows the settled turn, and the canceled tool
 	// call still has its (error) result recorded — no dangling tool_call.
@@ -608,9 +621,7 @@ func TestConversationClose(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !gate.sawCancel.Load() {
-		t.Fatal("active turn not canceled by Close")
-	}
+	waitToolCanceled(t, gate, "active turn not canceled by Close")
 	// Events channel closed.
 	for range c.Events() {
 	}
