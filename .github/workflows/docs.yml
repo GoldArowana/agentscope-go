@@ -40,6 +40,7 @@ jobs:
       - name: Run offline examples
         run: |
           go run ./examples/classifier
+          go run ./examples/goal_pipeline
           go run ./examples/managed_task
           go run ./examples/managed_routing
           go run ./examples/ask_user </dev/null

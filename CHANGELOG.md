@@ -11,6 +11,17 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Added — bounded goal execution
+
+- Experimental `pipeline.GoalPipeline` runs an executor and verifier with
+  bounded attempts, explicit outcomes and partial result history. UnifiedAgent
+  adapters correct report/verdict output without re-executing work and create a
+  fresh verifier per check. This first stage supports non-interactive text goals.
+- Experimental `UnifiedAgent.GenerateStructuredResponseWithUsage` generates
+  reports through model-call middleware from an internal conversation snapshot,
+  preserving known usage across compatibility attempts and errors.
+  See [the guide](docs/goal-pipeline.md) and offline `goal_pipeline` example.
+
 ### Fixed — provider retry cancellation
 
 - OpenAI and Anthropic `Chat` calls honor caller cancellation and deadlines
