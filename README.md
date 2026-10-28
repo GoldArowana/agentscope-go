@@ -179,6 +179,7 @@ its model choice, environment variables and required services or runtimes.
 | [agentic_memory](examples/agentic_memory/) | File-based memory and MEMORY.md |
 | [rag_react](examples/rag_react/) | Retrieval with an in-memory index |
 | [pipeline_multi_agent](examples/pipeline_multi_agent/) | Pipeline and MsgHub coordination |
+| [goal_pipeline](examples/goal_pipeline/) | Bounded executor-verifier loop with offline models and an actual artifact |
 | [agent_team](examples/agent_team/) | Leader/worker agent coordination |
 | [mcp](examples/mcp/) | MCP tool discovery and calls |
 | [mcp_streamable](examples/mcp_streamable/) | MCP Streamable HTTP client with an in-process spec server |
@@ -229,6 +230,7 @@ to the same catalog.
 | Managed text tasks | [Fixed-deployment execution, limits and accounting](docs/managed-task.md) · [Routing and deployment pools](docs/managed-routing.md) · [Evaluation workflow](docs/managed-routing-evaluation.md) |
 | Probabilistic classification | [Classifier API and attempt accounting](docs/classifier.md) · [Jev adapter](docs/jev.md) · [Bailian adapter](docs/bailian.md) · [OpenAI Decisions adapter](docs/openai-decisions.md) |
 | Middleware and memory | [Middleware](docs/middleware.md) |
+| Goal execution | [Experimental GoalPipeline and Agent adapters](docs/goal-pipeline.md) |
 | Application deployment | [Deployment](docs/deployment.md) · [Execution and session limits](docs/adversarial-hardening.md) · [Reply recovery](docs/reply-recovery.md) |
 | Runtime and evaluation | [Runtime features](docs/go-exclusive.md) · [Load and quality testing](docs/benchmarks.md) · [Replay and evaluation source](pkg/agentscope/replay/) |
 | Local models and devices | [Edge deployment](docs/edge-deployment.md) · [Device tools](docs/device-tools.md) · [Multi-device coordination](docs/multi-device.md) · [Offline operation](docs/offline-operation.md) |

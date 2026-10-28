@@ -47,6 +47,14 @@ feature is wired into every execution path.
 
 ### Agents, events and middleware
 
+Bounded goal execution lives in `pipeline/goal.go`, with UnifiedAgent
+adapters in `pipeline/goal_agent.go` and report generation in
+`agent/structured_usage.go`. The adapters join their local run scope before
+snapshotting context; output corrections never re-execute work. Keep report
+usage separate from work events, and preserve middleware error provenance so
+guardrail rejections cannot become compatibility retries.
+See [GoalPipeline](docs/goal-pipeline.md) for ownership and Stage 1 limits.
+
 `UnifiedAgent` is the primary agent implementation. `ReActAgent` is the deprecated
 JSON tool-calling implementation; avoid extending it when the feature belongs in
 the current agent. `UserAgent` and `A2AAgent` serve interactive-input and remote

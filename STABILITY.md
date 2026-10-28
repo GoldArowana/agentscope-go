@@ -87,6 +87,13 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
 
 ## Unreleased execution and retrieval behavior
 
+- `pipeline.GoalPipeline` and its Agent adapters are Experimental. The first
+  stage runs bounded, non-interactive executor-verifier checks with a run-local
+  goal; it does not add persistent goal storage or HITL resume.
+  `agent.UnifiedAgent.GenerateStructuredResponseWithUsage` and its
+  `StructuredResponse` result are Experimental additions within the Stable
+  agent package. See [the contract and limitations](docs/goal-pipeline.md).
+
 - `UnifiedAgent.Compact` is Experimental despite its placement in the
   Stable-tier `agent` package. It triggers the existing structured-summary
   compression on demand, skipping the trigger threshold, and reports whether
@@ -596,7 +603,7 @@ Each entry states the blocker, not a priority.
 
 | Upstream | Item | Why it is not here |
 |---|---|---|
-| #2428 | GoalPipeline | No Go goal/objective layer to hang it on; it would be a new subsystem, not a port |
+| #2428 | GoalPipeline | Bounded non-interactive execution is implemented in `pipeline`; streaming/HITL resume and persistent goals remain deferred. See [the guide](docs/goal-pipeline.md) |
 | #2386 / #2379 | team enhancements | `team/` is leader/worker only; the enhancements assume Python's team event model |
 | #2142 | full A2AAgent protocol | Needs an SDK decision first: hand-rolled types in `a2a/` versus depending on an A2A Go SDK |
 | #1755 | workspace prewarm pool | Prerequisites missing: isolation policy, and a workspace storage/lifecycle contract |
