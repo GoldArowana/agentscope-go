@@ -253,7 +253,7 @@ func (r *Router) Route(ctx context.Context, op *Operation) (*Record, error) {
 	for i, tier := range candidates {
 		p, attached := r.providers[tier]
 		if !attached {
-			if cerr := r.recordMissedTier(rec, tier, i); cerr != nil {
+			if cerr := r.recordMissedTier(rec, op, tier, i); cerr != nil {
 				return rec.Clone(), cerr
 			}
 			continue
@@ -380,13 +380,16 @@ func (r *Router) candidatesFor(op *Operation) []Tier {
 
 // recordMissedTier records a clean failed attempt for a policy tier with no
 // attached provider (DESIGN.md interpretation d).
-func (r *Router) recordMissedTier(rec *Record, tier Tier, idx int) error {
+func (r *Router) recordMissedTier(rec *Record, op *Operation, tier Tier, idx int) error {
 	reason := "policy-preferred"
 	if idx > 0 {
 		reason = "fallback-after-failure:" + string(rec.Attempts[len(rec.Attempts)-1].Tier)
 	}
 	r.log.mu.Lock()
 	defer r.log.mu.Unlock()
+	if code, err := r.guardLocked(op); err != nil {
+		return r.supersedeLocked(rec, code, err)
+	}
 	rec.Attempts = append(rec.Attempts, Attempt{
 		Seq:        len(rec.Attempts) + 1,
 		Tier:       tier,
@@ -403,6 +406,20 @@ func (r *Router) recordMissedTier(rec *Record, tier Tier, idx int) error {
 	return nil
 }
 
+// supersedeLocked stops the record because the guards ceased to hold after
+// admission; prior attempts remain as evidence and no further dispatch
+// happens. The caller must hold log.mu. There is no rollback: the guard
+// outcome is re-derivable, so memory and disk cannot diverge in substance
+// (DESIGN.md interpretation f).
+func (r *Router) supersedeLocked(rec *Record, code string, guardErr error) error {
+	rec.State = StateSuperseded
+	rec.StopReason = code
+	if perr := r.log.persistLocked(); perr != nil {
+		return fmt.Errorf("tierrouter: persist supersession: %w", perr)
+	}
+	return guardErr
+}
+
 // commitAttempt persists the attempt record before the provider call
 // (commit boundary, R1). It rechecks the dispatch guards (R2): if the epoch
 // advanced or the TTL elapsed since admission, the record is superseded —
@@ -411,14 +428,7 @@ func (r *Router) commitAttempt(rec *Record, op *Operation, tier Tier, reason str
 	r.log.mu.Lock()
 	defer r.log.mu.Unlock()
 	if code, err := r.guardLocked(op); err != nil {
-		rec.State = StateSuperseded
-		rec.StopReason = code
-		// No rollback: the guard outcome is re-derivable, so memory and disk
-		// cannot diverge in substance (DESIGN.md interpretation f).
-		if perr := r.log.persistLocked(); perr != nil {
-			return fmt.Errorf("tierrouter: persist supersession: %w", perr)
-		}
-		return err
+		return r.supersedeLocked(rec, code, err)
 	}
 	rec.Attempts = append(rec.Attempts, Attempt{
 		Seq:        len(rec.Attempts) + 1,

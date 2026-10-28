@@ -112,6 +112,7 @@ Operation states:
 | F12 | Epoch advances after admission but before the first dispatch → `superseded`, nothing dispatched | R2 |
 | F13 | Epoch advances, or TTL elapses, while the preferred provider is in flight, followed by a clean failure → in-flight attempt settles, fallback never dispatched | R2 |
 | F14 | Replaying a completed record after the root epoch advanced returns the historical record unchanged | R2, interpretation h |
+| F15 | Guards cease after admission and the remaining candidates are unattached → `superseded`, no missed-tier record after the guard failure | R2 |
 
 `TestFaultCorruptLog` additionally pins that a corrupt log file fails `Open`
 loudly instead of silently starting empty.

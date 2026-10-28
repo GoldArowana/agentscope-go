@@ -475,9 +475,9 @@ func TestFaultF11_CrashBetweenAttempts(t *testing.T) {
 	}
 }
 
-// hookPolicy runs hook when the policy is consulted — after admission,
-// before the first commit boundary — which is how a test interposes an epoch
-// advance into that window.
+// hookPolicy runs hook when the policy is consulted — after admit's guard
+// check, before the first commit boundary — which is how a test interposes
+// an epoch advance into that window.
 type hookPolicy struct {
 	inner Policy
 	hook  func()
@@ -587,6 +587,9 @@ func TestFaultF13_GuardStopsFallback(t *testing.T) {
 		if len(cloud.Requests()) != 1 || len(edge.Requests()) != 0 {
 			t.Fatalf("cloud=%d edge=%d, want 1/0", len(cloud.Requests()), len(edge.Requests()))
 		}
+		if _, err := r.Route(context.Background(), op); !errors.Is(err, ErrExpired) {
+			t.Fatalf("replay: want ErrExpired, got %v", err)
+		}
 	})
 }
 
@@ -619,5 +622,33 @@ func TestFaultF14_ReplayAfterEpochAdvancePreservesHistory(t *testing.T) {
 	}
 	if n := len(cloud.Requests()); n != 1 {
 		t.Fatalf("replay re-dispatched: %d requests", n)
+	}
+}
+
+// Fault test F15 (R2): the guards cease to hold after admission and the
+// remaining candidates are all unattached — even the no-dispatch path must
+// supersede rather than recording further attempts or reporting exhaustion.
+func TestFaultF15_MissedTierAlsoSupersedes(t *testing.T) {
+	epoch := int64(1)
+	device := NewFakeProvider(TierDevice)
+	device.FailNext = 1
+	// Policy: device (attached, fails cleanly), then edge (NOT attached).
+	// The epoch advances as the device call returns, before the missed-tier
+	// record for edge would be written.
+	devHook := hookProvider{inner: device, hook: func() { epoch = 2 }}
+	r, err := NewRouter(mustOpen(t, ""), StaticPolicy{Default: []Tier{TierDevice, TierEdge}},
+		func() int64 { return epoch }, devHook)
+	if err != nil {
+		t.Fatalf("new router: %v", err)
+	}
+	rec, err := r.Route(context.Background(), &Operation{ID: "f15", TaskEpoch: 1, Content: "x"})
+	if !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("want ErrStaleEpoch, got %v", err)
+	}
+	if rec.State != StateSuperseded || rec.StopReason != rejectStaleEpoch {
+		t.Fatalf("record: %+v", rec)
+	}
+	if len(rec.Attempts) != 1 || rec.Attempts[0].Outcome != AttemptFailed {
+		t.Fatalf("only the settled device attempt may be recorded: %+v", rec.Attempts)
 	}
 }
