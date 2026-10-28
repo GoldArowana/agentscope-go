@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/internal/runctx"
@@ -286,5 +287,86 @@ func TestStructuredPreservesCompleteJSONText(t *testing.T) {
 				t.Fatalf("complete JSON changed: %+v %v; want %s", r, err, raw)
 			}
 		})
+	}
+}
+
+func TestStructuredMiddleContextIsolation(t *testing.T) {
+	for _, hostHasReply := range []bool{false, true} {
+		for _, outcome := range []string{"success", "fallback", "provider_error", "middleware_error", "canceled", "no_agent_reply"} {
+			name := "absent/" + outcome
+			if hostHasReply {
+				name = "existing/" + outcome
+			}
+			t.Run(name, func(t *testing.T) {
+				host := middleware.MiddleContext{"host": map[string]any{"request": "original"}}
+				want := middleware.MiddleContext{"host": map[string]any{"request": "original"}}
+				if hostHasReply {
+					host["agent"] = map[string]any{"reply_id": "host-reply", "other": "original"}
+					want["agent"] = map[string]any{"reply_id": "host-reply", "other": "original"}
+				}
+				ctx, cancel := context.WithCancel(middleware.WithMiddleContext(context.Background(), host))
+				defer cancel()
+				failure := errors.New("fixture failure")
+				calls, hooks := 0, 0
+				replyID := "goal-reply"
+				if outcome == "no_agent_reply" {
+					replyID = ""
+				}
+				m := &structuredUsageModel{call: func(context.Context, []*message.Msg, model.CallOptions) (*model.ChatResponse, error) {
+					calls++
+					switch {
+					case outcome == "fallback" && calls == 1:
+						return nil, errors.New("tool_choice unsupported")
+					case outcome == "provider_error":
+						return nil, failure
+					case outcome == "canceled":
+						cancel()
+						return nil, context.Canceled
+					}
+					return &model.ChatResponse{Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: `{"report":"done"}`}}}, nil
+				}}
+				mw := &structuredUsageMiddleware{call: func(ctx context.Context, in *middleware.ModelCallInput, next middleware.ModelCallHandler) (*model.ChatResponse, error) {
+					mc := middleware.GetMiddleContext(ctx)
+					got, exists := mc.Get("agent", "reply_id")
+					if exists != (replyID != "") || (exists && got != replyID) {
+						t.Fatalf("helper reply ID: %v, %v; want %q", got, exists, replyID)
+					}
+					if _, inherited := mc["host"]; inherited {
+						t.Error("helper reused caller middleware state")
+					}
+					if previous, ok := mc.Get("fixture", "calls"); hooks > 0 && (!ok || previous != hooks) {
+						t.Error("compatibility attempts lost their middleware state")
+					}
+					hooks++
+					mc.Set("fixture", "calls", hooks)
+					if outcome == "middleware_error" {
+						return nil, failure
+					}
+					return next(ctx, in)
+				}}
+				a := NewUnifiedAgent("a", "system", m, WithState(&AgentState{ReplyID: replyID}), WithMiddlewares(mw))
+				r, err := a.GenerateStructuredResponseWithUsage(ctx, json.RawMessage(`{}`))
+				if !reflect.DeepEqual(host, want) {
+					t.Fatalf("caller MiddleContext changed: %#v; want %#v", host, want)
+				}
+				switch outcome {
+				case "provider_error", "middleware_error":
+					if !errors.Is(err, failure) {
+						t.Fatal(err)
+					}
+				case "canceled":
+					if !errors.Is(err, context.Canceled) {
+						t.Fatal(err)
+					}
+				default:
+					if err != nil || r == nil || string(r.Output) != `{"report":"done"}` {
+						t.Fatalf("%+v %v", r, err)
+					}
+				}
+				if outcome == "fallback" && calls != 2 {
+					t.Fatalf("compatibility calls = %d; want 2", calls)
+				}
+			})
+		}
 	}
 }

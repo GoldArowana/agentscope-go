@@ -19,7 +19,8 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   fresh verifier per check. This first stage supports non-interactive text goals.
 - Experimental `UnifiedAgent.GenerateStructuredResponseWithUsage` generates
   reports through model-call middleware from an internal conversation snapshot,
-  preserving known usage across compatibility attempts and errors.
+  preserving known usage across compatibility attempts and errors. Each call
+  isolates its middleware context so reply metadata cannot leak into the caller.
   See [the guide](docs/goal-pipeline.md) and offline `goal_pipeline` example.
 
 ### Fixed — provider retry cancellation

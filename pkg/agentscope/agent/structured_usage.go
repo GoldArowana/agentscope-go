@@ -30,6 +30,8 @@ type StructuredResponse struct {
 // Unlike the legacy helper, malformed/truncated candidates are not repaired.
 // Domain validation (including schema validation) remains the caller's job.
 // Errors after generation starts retain known usage but return no Output.
+// Each invocation uses a fresh MiddleContext, shared by its compatibility
+// requests. Typed reply-budget state attached to ctx remains shared.
 func (a *UnifiedAgent) GenerateStructuredResponseWithUsage(ctx context.Context, schema json.RawMessage) (*StructuredResponse, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("agent: nil context")
@@ -68,9 +70,7 @@ func (a *UnifiedAgent) GenerateStructuredResponseWithUsage(ctx context.Context, 
 	if err != nil {
 		return nil, fmt.Errorf("agent: structured snapshot: %w", err)
 	}
-	if middleware.GetMiddleContext(ctx) == nil {
-		ctx = middleware.WithMiddleContext(ctx, middleware.MiddleContext{})
-	}
+	ctx = middleware.WithMiddleContext(ctx, middleware.MiddleContext{})
 	if replyID != "" {
 		middleware.GetMiddleContext(ctx).Set("agent", "reply_id", replyID)
 	}
