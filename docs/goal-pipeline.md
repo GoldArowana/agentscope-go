@@ -109,8 +109,19 @@ a real provider call. No exact provider bill is promised, particularly for
 opaque internal retries. Existing cost middleware failure-accounting behavior
 is unchanged.
 
-For built-in token/USD reply budgets the adapters use
-`middleware.WithReplyBudgetSnapshot` across work and report generation.
+For built-in token/USD reply budgets, each `Execute` or `Verify` call starts a
+fresh scope with `middleware.WithReplyBudgetSnapshot(ctx, nil)`. Within that
+call, work, report/verdict generation, output corrections and compatibility
+requests share the counters. The executor and verifier have separate scopes,
+and counters restart on their next call, including the next pipeline attempt.
+
+This local scope shadows any reply-budget snapshot attached by the host;
+Goal adapter usage does not charge those host counters. These per-call budgets
+do not cap the whole `Run`: total consumption can grow with the number of
+attempts. Built-in budgets observe successful model calls and may overshoot a
+threshold; they are not a hard limit on provider charges. Hosts needing a
+run-wide limit must enforce it separately.
+
 Arbitrary custom middleware state is not automatically shared. Work usage comes
 from existing model-call events, which cannot distinguish absent usage from
 known zero or expose all internal retries. Consequently Agent-adapter totals
