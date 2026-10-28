@@ -185,11 +185,11 @@ type anthropicResponse struct {
 
 // Chat implements the non-streaming ChatModel call for Anthropic.
 func (m *AnthropicChatModel) Chat(ctx context.Context, msgs []*message.Msg, opts ...CallOption) (*ChatResponse, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("anthropic: context must not be nil")
-	}
 	if len(msgs) == 0 {
 		return nil, fmt.Errorf("anthropic: msgs must not be empty")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("anthropic: context must not be nil")
 	}
 
 	callOpts := &CallOptions{}

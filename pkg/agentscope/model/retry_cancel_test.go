@@ -231,3 +231,31 @@ func TestProviderChatNilContext(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderChatEmptyMessagesBeforeNilContext(t *testing.T) {
+	for _, provider := range []string{"openai", "anthropic"} {
+		for _, tc := range []struct {
+			name string
+			msgs []*message.Msg
+		}{
+			{"nil", nil},
+			{"empty", []*message.Msg{}},
+		} {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				var calls int
+				m := retryTestModel(t, provider, func(*http.Request) (*http.Response, error) {
+					calls++
+					return retryTestResponse(provider, http.StatusOK), nil
+				})
+				_, err := m.Chat(nil, tc.msgs) //nolint:staticcheck // Exercise validation when both arguments are invalid.
+				want := provider + ": msgs must not be empty"
+				if err == nil || err.Error() != want {
+					t.Errorf("Chat error = %v, want %q", err, want)
+				}
+				if calls != 0 {
+					t.Errorf("HTTP calls with invalid arguments = %d, want 0", calls)
+				}
+			})
+		}
+	}
+}
