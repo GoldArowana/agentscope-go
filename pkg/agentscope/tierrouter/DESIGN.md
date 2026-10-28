@@ -70,8 +70,10 @@ Operation states:
   operation at admission is rejected and the rejection is recorded; if the
   guards cease to hold *after* admission — the epoch advanced or the TTL
   elapsed while an attempt was in flight — the in-flight attempt settles
-  truthfully, no further dispatch happens, and the record is `superseded`
-  with the stop reason recorded. Neither is silently re-evaluated later.
+  truthfully; when a further dispatch decision is reached, the guards block
+  it and the record is `superseded` with the stop reason recorded. (If no
+  candidate remains, the loop instead settles as `exhausted` on the settled
+  evidence.) Neither is silently re-evaluated later.
 - **R3 Idempotent identity** — same `id` + same content replays the recorded
   outcome without re-dispatch, including across restart. Same `id` +
   different content is a conflict rejection. Concurrent duplicates serialize
