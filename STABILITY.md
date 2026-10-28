@@ -134,6 +134,14 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
   is supplied. `classifier.DispatchClassifier` is opt-in; ordinary `Classify` is
   compatible. See the [routing guide](docs/managed-routing.md).
 
+- Experimental `tierrouter.ChatRouter` adapts three-tier operation routing to
+  ordinary buffered `ChatModel` calls. It supports plain-text fake deployments,
+  dispatch and result-admission epoch/TTL guards, and process-local idempotent
+  replay. It does not govern streaming, tools, multimodal/helper paths, real
+  provider error evidence or durable response recovery. The exercised Agent
+  configuration disables streaming, Agent fallback and additional retries.
+  See the [three-tier routing guide](docs/tier-routing.md).
+
 - Experimental `evalkit.Runner.RunManagedLoad` evaluates the managed entry point
   directly with independent scoring and all-arrival/cost reporting. It creates no
   qualification records; offline fixtures and opt-in live quality pilots are

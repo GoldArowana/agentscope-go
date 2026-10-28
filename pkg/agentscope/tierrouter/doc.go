@@ -11,6 +11,11 @@
 // identity. Grading reads the decision log and the providers' request
 // records, never a provider's self-report.
 //
+// ChatRouter separately adapts three-tier policies to plain-text, buffered
+// ChatModel calls with fake deployments. It keeps chat records and completed
+// responses in memory, guards dispatch and result admission with the original
+// operation epoch/TTL, and never creates a taskenvelope subtask.
+//
 // Experimental: the API is not covered by the Stable tier in STABILITY.md
 // and may change between releases.
 package tierrouter

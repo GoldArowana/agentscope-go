@@ -239,6 +239,14 @@ Jev/Fake implement `classifier.DispatchClassifier` for dispatch-time policy and
 accounting. See [routing contracts](docs/managed-routing.md). Routes never mutate
 a shared Agent; ordinary Agent/Chat paths remain outside this boundary.
 
+Experimental `tierrouter.ChatRouter` is a separate opt-in `ChatModel` wrapper
+for the actual buffered `UnifiedAgent.Reply` path with plain-text fake
+deployments. It owns routing and fallback under the configured single-attempt
+Agent setup, checks epoch/TTL before dispatch and before accepting responses,
+and keeps completed responses only for process-local replay. It does not alter
+`managedtask`, cover streaming/tools/multimodal/helpers, or recover responses
+across processes. See [three-tier routing](docs/tier-routing.md).
+
 ### Context and model capabilities
 
 [agent/compress.go](pkg/agentscope/agent/compress.go) owns compression thresholds,
