@@ -294,6 +294,18 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   bounds-checked on every outcome path, and `Resolve` validates before it
   mutates. The package shares no state with `agent`, `storage` or
   `managedtask`, and its API is not Stable-tier.
+- Experimental `tierrouter` package: the routing-side sibling from issue
+  #67 — three-tier (device/edge/cloud) fake providers plus an
+  operation-level routing policy, as a self-contained reference
+  implementation. It models the routing contract (see `tierrouter/DESIGN.md`):
+  a serialized decision point that rechecks task epoch and TTL at admission
+  and at every dispatch, a persisted
+  decision log with a commit boundary before any provider call, guarded
+  fallback with failure evidence, a local-only guard that binds regardless of
+  policy preference, unknown-outcome attempts that are never auto-retried,
+  and crash-window reconciliation on reopen — all exercised by fault tests
+  that map 1:1 to the invariants. Selecting another model endpoint creates
+  no subtask envelope; the API is not Stable-tier.
 
 - `mcp/streamablehttp` provides a Streamable HTTP client for MCP (#55, #63),
   backed by the official `modelcontextprotocol/go-sdk` (pinned v1.8.0) — the
