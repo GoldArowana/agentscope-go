@@ -69,17 +69,18 @@ const (
 type OpState string
 
 const (
-	StatePending   OpState = "pending"   // admitted; an attempt may be in flight
-	StateCompleted OpState = "completed" // an attempt completed (terminal)
-	StateRejected  OpState = "rejected"  // never dispatched (terminal)
-	StateExhausted OpState = "exhausted" // every candidate tier failed cleanly (terminal)
-	StateUncertain OpState = "uncertain" // an attempt outcome is unknown
+	StatePending    OpState = "pending"    // admitted; an attempt may be in flight
+	StateCompleted  OpState = "completed"  // an attempt completed (terminal)
+	StateRejected   OpState = "rejected"   // never dispatched (terminal)
+	StateExhausted  OpState = "exhausted"  // every candidate tier failed cleanly (terminal)
+	StateSuperseded OpState = "superseded" // admitted, then the guards ceased to hold before a later dispatch (terminal)
+	StateUncertain  OpState = "uncertain"  // an attempt outcome is unknown
 )
 
 // Terminal reports whether the state is terminal.
 func (s OpState) Terminal() bool {
 	switch s {
-	case StateCompleted, StateRejected, StateExhausted:
+	case StateCompleted, StateRejected, StateExhausted, StateSuperseded:
 		return true
 	}
 	return false
@@ -107,11 +108,14 @@ type Attempt struct {
 
 // Record is a routing decision record (DESIGN.md "Model").
 type Record struct {
-	ID          string    `json:"id"`
-	ContentHash string    `json:"content_hash"`
-	TaskEpoch   int64     `json:"task_epoch"`
-	State       OpState   `json:"state"`
-	RejectCode  string    `json:"reject_code,omitempty"`
+	ID          string  `json:"id"`
+	ContentHash string  `json:"content_hash"`
+	TaskEpoch   int64   `json:"task_epoch"`
+	State       OpState `json:"state"`
+	RejectCode  string  `json:"reject_code,omitempty"`
+	// StopReason records why a superseded record stopped ("stale-epoch" or
+	// "expired"); prior attempts remain as evidence.
+	StopReason  string    `json:"stop_reason,omitempty"`
 	Attempts    []Attempt `json:"attempts,omitempty"`
 	SubmittedAt time.Time `json:"submitted_at"`
 }
@@ -258,7 +262,7 @@ func (r *Router) Route(ctx context.Context, op *Operation) (*Record, error) {
 		if i > 0 {
 			reason = "fallback-after-failure:" + string(candidates[i-1])
 		}
-		if cerr := r.commitAttempt(rec, tier, reason); cerr != nil {
+		if cerr := r.commitAttempt(rec, op, tier, reason); cerr != nil {
 			return rec.Clone(), cerr
 		}
 
@@ -286,6 +290,22 @@ func (r *Router) Route(ctx context.Context, op *Operation) (*Record, error) {
 		return out, fmt.Errorf("tierrouter: persist exhaustion: %w", perr)
 	}
 	return out, fmt.Errorf("%w: %s", ErrExhausted, op.ID)
+}
+
+// guardLocked checks the dispatch guards (R2): the operation's task epoch
+// must equal the current epoch and its TTL must not have elapsed. The caller
+// must hold log.mu. admit checks it for new operations and commitAttempt
+// rechecks it before every dispatch, so an epoch advance or TTL expiry
+// between admission and a later attempt blocks the dispatch.
+func (r *Router) guardLocked(op *Operation) (string, error) {
+	if current := r.epoch(); op.TaskEpoch != current {
+		return rejectStaleEpoch, fmt.Errorf("%w: %s (op epoch %d, current %d)",
+			ErrStaleEpoch, op.ID, op.TaskEpoch, current)
+	}
+	if deadline, ok := op.Deadline(); ok && !r.now().Before(deadline) {
+		return rejectExpired, fmt.Errorf("%w: %s", ErrExpired, op.ID)
+	}
+	return "", nil
 }
 
 // admit replays an existing record or admits a new one under the serialized
@@ -320,12 +340,8 @@ func (r *Router) admit(op *Operation, hash string) (*Record, error) {
 		return rec.Clone(), err
 	}
 
-	if current := r.epoch(); op.TaskEpoch != current {
-		return reject(rejectStaleEpoch, fmt.Errorf("%w: %s (op epoch %d, current %d)",
-			ErrStaleEpoch, op.ID, op.TaskEpoch, current))
-	}
-	if deadline, ok := op.Deadline(); ok && !r.now().Before(deadline) {
-		return reject(rejectExpired, fmt.Errorf("%w: %s", ErrExpired, op.ID))
+	if code, err := r.guardLocked(op); err != nil {
+		return reject(code, err)
 	}
 	if len(r.candidatesFor(op)) == 0 {
 		return reject(rejectNoRoute, fmt.Errorf("%w: %s (kind %q)", ErrNoRoute, op.ID, op.Kind))
@@ -388,10 +404,22 @@ func (r *Router) recordMissedTier(rec *Record, tier Tier, idx int) error {
 }
 
 // commitAttempt persists the attempt record before the provider call
-// (commit boundary, R1).
-func (r *Router) commitAttempt(rec *Record, tier Tier, reason string) error {
+// (commit boundary, R1). It rechecks the dispatch guards (R2): if the epoch
+// advanced or the TTL elapsed since admission, the record is superseded —
+// prior attempts remain as evidence and no further dispatch happens.
+func (r *Router) commitAttempt(rec *Record, op *Operation, tier Tier, reason string) error {
 	r.log.mu.Lock()
 	defer r.log.mu.Unlock()
+	if code, err := r.guardLocked(op); err != nil {
+		rec.State = StateSuperseded
+		rec.StopReason = code
+		// No rollback: the guard outcome is re-derivable, so memory and disk
+		// cannot diverge in substance (DESIGN.md interpretation f).
+		if perr := r.log.persistLocked(); perr != nil {
+			return fmt.Errorf("tierrouter: persist supersession: %w", perr)
+		}
+		return err
+	}
 	rec.Attempts = append(rec.Attempts, Attempt{
 		Seq:        len(rec.Attempts) + 1,
 		Tier:       tier,
@@ -461,6 +489,11 @@ func replayError(rec *Record) error {
 		return fmt.Errorf("%w: %s", ErrInFlight, rec.ID)
 	case StateExhausted:
 		return fmt.Errorf("%w: %s", ErrExhausted, rec.ID)
+	case StateSuperseded:
+		if rec.StopReason == rejectExpired {
+			return fmt.Errorf("%w: %s", ErrExpired, rec.ID)
+		}
+		return fmt.Errorf("%w: %s", ErrStaleEpoch, rec.ID)
 	default:
 		return fmt.Errorf("%w: %s", ErrUncertain, rec.ID)
 	}

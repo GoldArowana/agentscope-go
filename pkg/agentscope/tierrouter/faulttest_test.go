@@ -474,3 +474,150 @@ func TestFaultF11_CrashBetweenAttempts(t *testing.T) {
 		t.Fatal("the undispatched fallback must not fire after reopen")
 	}
 }
+
+// hookPolicy runs hook when the policy is consulted — after admission,
+// before the first commit boundary — which is how a test interposes an epoch
+// advance into that window.
+type hookPolicy struct {
+	inner Policy
+	hook  func()
+}
+
+func (p hookPolicy) Prefer(op *Operation) []Tier {
+	p.hook()
+	return p.inner.Prefer(op)
+}
+
+// hookProvider runs hook as the provider call returns, modeling an epoch
+// advance or clock jump while the preferred provider is in flight.
+type hookProvider struct {
+	inner *FakeProvider
+	hook  func()
+}
+
+func (p hookProvider) Tier() Tier { return p.inner.Tier() }
+
+func (p hookProvider) Complete(ctx context.Context, op *Operation) (string, error) {
+	defer p.hook()
+	return p.inner.Complete(ctx, op)
+}
+
+// Fault test F12 (R2): the epoch advances after admission but before the
+// first dispatch. The commit boundary rechecks the guards, supersedes the
+// operation, and nothing is dispatched.
+func TestFaultF12_EpochAdvanceBeforeFirstDispatch(t *testing.T) {
+	epoch := int64(1)
+	device := NewFakeProvider(TierDevice)
+	policy := hookPolicy{
+		inner: StaticPolicy{Default: []Tier{TierDevice}},
+		hook:  func() { epoch = 2 },
+	}
+	r := newHarness(t, "", func() int64 { return epoch }, policy, device)
+
+	rec, err := r.Route(context.Background(), &Operation{ID: "f12", TaskEpoch: 1, Content: "x"})
+	if !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("want ErrStaleEpoch, got %v", err)
+	}
+	if rec.State != StateSuperseded || rec.StopReason != rejectStaleEpoch {
+		t.Fatalf("record: %+v", rec)
+	}
+	if len(rec.Attempts) != 0 {
+		t.Fatalf("superseded before any attempt, got %+v", rec.Attempts)
+	}
+	if len(device.Requests()) != 0 {
+		t.Fatal("stale operation must not dispatch")
+	}
+	// Replay reports the recorded supersession, not a fresh admission.
+	if _, err := r.Route(context.Background(), &Operation{ID: "f12", TaskEpoch: 1, Content: "x"}); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("replay: want ErrStaleEpoch, got %v", err)
+	}
+	if len(device.Requests()) != 0 {
+		t.Fatal("superseded replay must not dispatch")
+	}
+}
+
+// Fault test F13 (R2): the epoch advances, or the TTL elapses, while the
+// preferred provider is in flight; the in-flight attempt settles truthfully
+// and the fallback is never dispatched.
+func TestFaultF13_GuardStopsFallback(t *testing.T) {
+	t.Run("epoch advance", func(t *testing.T) {
+		epoch := int64(1)
+		cloud := NewFakeProvider(TierCloud)
+		cloud.FailNext = 1
+		edge := NewFakeProvider(TierEdge)
+		r := newHarness(t, "", func() int64 { return epoch },
+			StaticPolicy{Default: []Tier{TierCloud, TierEdge}},
+			hookProvider{inner: cloud, hook: func() { epoch = 2 }}, edge)
+
+		rec, err := r.Route(context.Background(), &Operation{ID: "f13-e", TaskEpoch: 1, Content: "x"})
+		if !errors.Is(err, ErrStaleEpoch) {
+			t.Fatalf("want ErrStaleEpoch, got %v", err)
+		}
+		if rec.State != StateSuperseded || rec.StopReason != rejectStaleEpoch {
+			t.Fatalf("record: %+v", rec)
+		}
+		// The in-flight attempt's clean failure survives as evidence.
+		if len(rec.Attempts) != 1 || rec.Attempts[0].Outcome != AttemptFailed {
+			t.Fatalf("attempts: %+v", rec.Attempts)
+		}
+		if len(cloud.Requests()) != 1 || len(edge.Requests()) != 0 {
+			t.Fatalf("cloud=%d edge=%d, want 1/0", len(cloud.Requests()), len(edge.Requests()))
+		}
+	})
+
+	t.Run("ttl expiry", func(t *testing.T) {
+		now := time.Now()
+		clock := &now
+		cloud := NewFakeProvider(TierCloud)
+		cloud.FailNext = 1
+		edge := NewFakeProvider(TierEdge)
+		r := newHarness(t, "", func() int64 { return 1 },
+			StaticPolicy{Default: []Tier{TierCloud, TierEdge}},
+			hookProvider{inner: cloud, hook: func() { *clock = now.Add(2 * time.Minute) }}, edge)
+		r.now = func() time.Time { return *clock }
+
+		op := &Operation{ID: "f13-t", TaskEpoch: 1, Content: "x", TTL: time.Minute, SubmittedAt: now}
+		rec, err := r.Route(context.Background(), op)
+		if !errors.Is(err, ErrExpired) {
+			t.Fatalf("want ErrExpired, got %v", err)
+		}
+		if rec.State != StateSuperseded || rec.StopReason != rejectExpired {
+			t.Fatalf("record: %+v", rec)
+		}
+		if len(cloud.Requests()) != 1 || len(edge.Requests()) != 0 {
+			t.Fatalf("cloud=%d edge=%d, want 1/0", len(cloud.Requests()), len(edge.Requests()))
+		}
+	})
+}
+
+// Fault test F14 (R2, interpretation h): replaying a completed record after
+// the root epoch advanced returns the historical record unchanged — replay
+// preserves evidence, and using the result requires a separate current-state
+// check by the caller.
+func TestFaultF14_ReplayAfterEpochAdvancePreservesHistory(t *testing.T) {
+	epoch := int64(1)
+	cloud := NewFakeProvider(TierCloud)
+	cloud.Reply = "epoch-1-answer"
+	r := newHarness(t, "", func() int64 { return epoch },
+		StaticPolicy{Default: []Tier{TierCloud}}, cloud)
+
+	op := &Operation{ID: "f14", TaskEpoch: 1, Content: "x"}
+	if _, err := r.Route(context.Background(), op); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	epoch = 2
+
+	rec, err := r.Route(context.Background(), op)
+	if err != nil {
+		t.Fatalf("replay must return the historical record, got %v", err)
+	}
+	if rec.State != StateCompleted || rec.TaskEpoch != 1 {
+		t.Fatalf("record: %+v", rec)
+	}
+	if res, _ := rec.Result(); res != "epoch-1-answer" {
+		t.Fatalf("historical result: %q", res)
+	}
+	if n := len(cloud.Requests()); n != 1 {
+		t.Fatalf("replay re-dispatched: %d requests", n)
+	}
+}

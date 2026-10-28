@@ -286,7 +286,8 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   #67 — three-tier (device/edge/cloud) fake providers plus an
   operation-level routing policy, as a self-contained reference
   implementation. It models the routing contract (see `tierrouter/DESIGN.md`):
-  a serialized decision point that rechecks task epoch and TTL, a persisted
+  a serialized decision point that rechecks task epoch and TTL at admission
+  and at every dispatch, a persisted
   decision log with a commit boundary before any provider call, guarded
   fallback with failure evidence, a local-only guard that binds regardless of
   policy preference, unknown-outcome attempts that are never auto-retried,

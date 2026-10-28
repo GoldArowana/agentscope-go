@@ -56,6 +56,7 @@ Operation states:
 | `completed` | an attempt completed; result recorded | yes |
 | `rejected` | never dispatched: stale epoch, expired TTL, or no route | yes |
 | `exhausted` | every candidate tier failed cleanly | yes |
+| `superseded` | admitted, then the guards ceased to hold before a later dispatch; prior attempts remain as evidence | yes |
 | `uncertain` | an attempt outcome is unknown | no automatic exit; retry means a new operation id |
 
 ## Invariants
@@ -63,9 +64,14 @@ Operation states:
 - **R1 Recorded decisions** — every dispatch has an attempt record persisted
   *before* the provider call (commit boundary). Grading reads the decision
   log and provider request records.
-- **R2 Epoch binding** — dispatch requires `task_epoch == current epoch`,
-  rechecked at the serialized decision point. A stale operation is rejected
-  and the rejection is recorded; it is never silently re-evaluated later.
+- **R2 Epoch binding** — dispatch requires `task_epoch == current epoch` and
+  remaining TTL, checked at admission and rechecked at every dispatch
+  decision point (each attempt's commit boundary). A stale or expired
+  operation at admission is rejected and the rejection is recorded; if the
+  guards cease to hold *after* admission — the epoch advanced or the TTL
+  elapsed while an attempt was in flight — the in-flight attempt settles
+  truthfully, no further dispatch happens, and the record is `superseded`
+  with the stop reason recorded. Neither is silently re-evaluated later.
 - **R3 Idempotent identity** — same `id` + same content replays the recorded
   outcome without re-dispatch, including across restart. Same `id` +
   different content is a conflict rejection. Concurrent duplicates serialize
@@ -103,6 +109,9 @@ Operation states:
 | F9 | Policy tier with no attached provider → clean failed attempt with configuration evidence; chain continues | R4, interpretation d |
 | F10 | Kill after admission but before the first attempt (pending, zero attempts) → reopen → `uncertain`, replay `ErrUncertain` | R6 |
 | F11 | Kill between attempts (pending, all attempts settled after a clean failure) → reopen → `uncertain`, replay `ErrUncertain` | R6 |
+| F12 | Epoch advances after admission but before the first dispatch → `superseded`, nothing dispatched | R2 |
+| F13 | Epoch advances, or TTL elapses, while the preferred provider is in flight, followed by a clean failure → in-flight attempt settles, fallback never dispatched | R2 |
+| F14 | Replaying a completed record after the root epoch advanced returns the historical record unchanged | R2, interpretation h |
 
 `TestFaultCorruptLog` additionally pins that a corrupt log file fails `Open`
 loudly instead of silently starting empty.
@@ -137,3 +146,17 @@ f. Persist failures roll back only state whose external effect has not
    ID with a wrong signal. After a provider call there is no rollback — the
    in-memory outcome is the most truthful evidence available, and the caller
    sees the wrapped persist error.
+   A guard-driven supersession is also kept: the guard outcome is
+   re-derivable from the epoch source and clock, so memory and disk cannot
+   diverge in substance.
+g. Error classification here is a fakes simplification: every non-context
+   provider error is a clean failure (fallback allowed). Real transport or
+   decoding errors do not necessarily prove no result was produced — a
+   connection reset mid-body is ambiguous. Real provider integration needs
+   typed outcome evidence distinguishing provably-no-result failures from
+   ambiguous ones; the latter must classify as `unknown` (R5).
+h. Replay preserves history, not permission. A replayed record is evidence
+   of what happened under its epoch; acting on a replayed result requires a
+   separate current-state check by the caller (compare the record's
+   `task_epoch` with the current epoch), mirroring the taskenvelope T4
+   guard.
