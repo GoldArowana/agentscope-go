@@ -42,13 +42,15 @@ func TestTeamMemberTerminalAndFinalTextPolicy(t *testing.T) {
 		reason                             types.ReplyFinishedReason
 		partial, missing, mediaOnly, mixed bool
 		want                               message.ToolResultState
+		terminalError, wantOutput          string
 	}{
 		{name: "normal", reason: types.ReplyCompleted, want: message.ToolResultSuccess},
-		{name: "max iterations", reason: types.ReplyExceedMaxIters, want: message.ToolResultError},
-		{name: "member error", reason: types.ReplyError, want: message.ToolResultError},
-		{name: "member interrupted", reason: types.ReplyInterrupted, want: message.ToolResultInterrupted},
+		{name: "max iterations", reason: types.ReplyExceedMaxIters, want: message.ToolResultError, wantOutput: "pipeline: A finished as exceed_max_iters"},
+		{name: "member error", reason: types.ReplyError, want: message.ToolResultError, terminalError: "fixture terminal failure", wantOutput: "pipeline: A finished as error: fixture terminal failure"},
+		{name: "member interrupted", reason: types.ReplyInterrupted, want: message.ToolResultInterrupted, wantOutput: "pipeline: A finished as interrupted"},
 		{name: "missing terminal", missing: true, want: message.ToolResultError},
-		{name: "partial final model", reason: types.ReplyCompleted, partial: true, want: message.ToolResultError},
+		{name: "partial final model", reason: types.ReplyCompleted, partial: true, want: message.ToolResultError, wantOutput: "pipeline: A final model round is incomplete"},
+		{name: "partial model with terminal error", reason: types.ReplyError, partial: true, want: message.ToolResultError, terminalError: "fixture terminal failure", wantOutput: "pipeline: A finished as error: fixture terminal failure"},
 		{name: "media only", reason: types.ReplyCompleted, mediaOnly: true, want: message.ToolResultError},
 		{name: "mixed media text", reason: types.ReplyCompleted, mixed: true, want: message.ToolResultSuccess},
 	} {
@@ -68,7 +70,11 @@ func TestTeamMemberTerminalAndFinalTextPolicy(t *testing.T) {
 					ev = append(ev, event.NewCustomEvent("reply", "model_partial_response", nil))
 				}
 				if !tc.missing {
-					ev = append(ev, event.NewReplyEndEventWithReason("session", "reply", tc.reason))
+					terminal := event.NewReplyEndEventWithReason("session", "reply", tc.reason)
+					if tc.terminalError != "" {
+						terminal.Error = &types.ReplyErrorInfo{Message: tc.terminalError}
+					}
+					ev = append(ev, terminal)
 				}
 				return ev
 			}}
@@ -79,6 +85,9 @@ func TestTeamMemberTerminalAndFinalTextPolicy(t *testing.T) {
 				}
 				if tc.want == message.ToolResultSuccess && results[0].GetOutputText() != "final answer" {
 					return fmt.Errorf("wrong final text: %q", results[0].GetOutputText())
+				}
+				if tc.wantOutput != "" && results[0].GetOutputText() != tc.wantOutput {
+					return fmt.Errorf("wrong member diagnostic: got %q, want %q", results[0].GetOutputText(), tc.wantOutput)
 				}
 				return nil
 			}), member)
@@ -126,7 +135,7 @@ func TestTeamActualStreamingUsesOnlyFinalModelRound(t *testing.T) {
 }
 
 func TestTeamActualMemberFailuresAreNonSuccess(t *testing.T) {
-	for _, kind := range []string{"model error", "max iterations", "media only", "mixed text media"} {
+	for _, kind := range []string{"model error", "max iterations", "partial final round", "media only", "mixed text media"} {
 		t.Run(kind, func(t *testing.T) {
 			n := 0
 			member := teamMember("A", func(context.Context, []*message.Msg, model.CallOptions) (*model.ChatResponse, error) {
@@ -134,6 +143,8 @@ func TestTeamActualMemberFailuresAreNonSuccess(t *testing.T) {
 				switch kind {
 				case "model error":
 					return nil, fmt.Errorf("fixture permanent error")
+				case "partial final round":
+					return &model.ChatResponse{Content: []message.ContentBlock{message.TextBlock{Type: "text", Text: "truncated answer"}}, Error: errors.New("fixture truncated final round")}, nil
 				case "max iterations":
 					if n == 1 {
 						return &model.ChatResponse{Content: []message.ContentBlock{teamCall("noop", "noop", `{}`)}}, nil
@@ -157,6 +168,9 @@ func TestTeamActualMemberFailuresAreNonSuccess(t *testing.T) {
 					}
 				} else if results[0].State != message.ToolResultError {
 					return fmt.Errorf("failure reported as success: %v", results)
+				}
+				if kind == "partial final round" && results[0].GetOutputText() != "pipeline: A final model round is incomplete" {
+					return fmt.Errorf("misleading partial-output diagnostic: %q", results[0].GetOutputText())
 				}
 				return nil
 			}), member)

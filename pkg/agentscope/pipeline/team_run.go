@@ -202,6 +202,9 @@ func (r *TeamRun) participant(parent context.Context, a *agent.UnifiedAgent, inp
 	out.reason = end.FinishedReason
 	if end.FinishedReason != types.ReplyCompleted || partial {
 		out.err = fmt.Errorf("pipeline: %s finished as %s", a.Name(), end.FinishedReason)
+		if end.FinishedReason == types.ReplyCompleted {
+			out.err = fmt.Errorf("pipeline: %s final model round is incomplete", a.Name())
+		}
 		if end.Error != nil {
 			out.err = fmt.Errorf("%w: %s", out.err, end.Error.Message)
 		}

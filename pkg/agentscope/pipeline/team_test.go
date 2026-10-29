@@ -219,6 +219,75 @@ func teamOptions(tools ...tool.Tool) []agent.AgentOption {
 	return []agent.AgentOption{agent.WithToolkit(tool.NewToolkit(tools...)), agent.WithModelStreaming(false), agent.WithPermissionContext(permission.NewContext(permission.ModeBypass)), agent.WithReactConfig(agent.ReactConfig{MaxIters: 8})}
 }
 
+func TestTeamAssignRejectsInvalidOrCanceledRequests(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, wantOutput string
+		canceled                bool
+		wantState               message.ToolResultState
+	}{
+		{name: "malformed JSON", input: `{"member":`, wantState: message.ToolResultError, wantOutput: "invalid TeamAssign input"},
+		{name: "unknown member", input: `{"member":"missing","prompt":"task"}`, wantState: message.ToolResultError, wantOutput: "unknown member or empty assignment prompt"},
+		{name: "empty prompt", input: `{"member":"A","prompt":""}`, wantState: message.ToolResultError, wantOutput: "unknown member or empty assignment prompt"},
+		{name: "whitespace prompt", input: `{"member":"A","prompt":" \t\n"}`, wantState: message.ToolResultError, wantOutput: "unknown member or empty assignment prompt"},
+		{name: "canceled before assignment", input: `{"member":"A","prompt":"task"}`, canceled: true, wantState: message.ToolResultInterrupted, wantOutput: "team canceled before assignment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			calls := 0
+			member := teamMember("A", func(context.Context, []*message.Msg, model.CallOptions) (*model.ChatResponse, error) {
+				calls++
+				return teamText("unexpected member execution"), nil
+			})
+			worker, err := member.Factory(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := newTeamRun(ctx, cancel, map[string]*agent.UnifiedAgent{"A": worker})
+			if tc.canceled {
+				cancel()
+			}
+			call := teamCall("rejected-assignment", TeamAssignToolName, tc.input)
+			result := r.assign(ctx, &call)
+			if result.Type != "tool_result" || result.ID != call.ID || result.Name != call.Name {
+				t.Fatalf("assignment result lost call identity: %+v", result)
+			}
+			if result.State != tc.wantState || result.GetOutputText() != tc.wantOutput {
+				t.Fatalf("unexpected assignment result: %+v", result)
+			}
+			if calls != 0 {
+				t.Fatalf("rejected assignment invoked member model %d times", calls)
+			}
+		})
+	}
+}
+
+func TestTeamUnknownMemberRejectedBeforeDelegation(t *testing.T) {
+	calls := 0
+	member := teamMember("A", func(context.Context, []*message.Msg, model.CallOptions) (*model.ChatResponse, error) {
+		calls++
+		return teamText("unexpected member execution"), nil
+	})
+	p, err := NewTeamPipeline(teamLeader([]message.ToolCallBlock{teamCall("unknown", TeamAssignToolName, `{"member":"missing","prompt":"task"}`)}, func(results []message.ToolResultBlock) error {
+		if len(results) != 1 || results[0].ID != "unknown" || results[0].Name != TeamAssignToolName || results[0].State != message.ToolResultError {
+			return fmt.Errorf("unknown-member error was not returned to leader: %v", results)
+		}
+		if output := results[0].GetOutputText(); !strings.Contains(output, `field "member"`) || !strings.Contains(output, "not one of the allowed values") {
+			return fmt.Errorf("unknown member bypassed assignment schema: %q", output)
+		}
+		return nil
+	}), member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := teamDrain(t, p, nil); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("unknown assignment invoked registered member %d times", calls)
+	}
+}
+
 func TestTeamRoundTripRetainsNamedMemberHistory(t *testing.T) {
 	var order []string
 	leader := func(_ context.Context, assign tool.Tool) (*agent.UnifiedAgent, error) {
