@@ -55,6 +55,14 @@ usage separate from work events, and preserve middleware error provenance so
 guardrail rejections cannot become compatibility retries.
 See [GoalPipeline](docs/goal-pipeline.md) for ownership and Stage 1 limits.
 
+`pipeline/team*.go` implements serial TeamPipeline delegation. Factories install
+the reserved external TeamAssign explicitly; the coordinator validates pending
+participant input, copies submissions without losing typed permission rules,
+and joins an invocation-local run scope before returning a member result. Final
+text is selected by model-round events, never by flattening the whole reply.
+The existing external barrier and required agent/tool interfaces are unchanged.
+See [TeamPipeline](docs/team-pipeline.md) for factory, input and cleanup limits.
+
 `UnifiedAgent` is the primary agent implementation. `ReActAgent` is the deprecated
 JSON tool-calling implementation; avoid extending it when the feature belongs in
 the current agent. `UserAgent` and `A2AAgent` serve interactive-input and remote

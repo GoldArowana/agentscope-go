@@ -57,6 +57,7 @@ see the [AskUser contract](tools.md#askuser).
 | [rag_react](../examples/rag_react/) | Retrieval with an in-memory index |
 | [pipeline_multi_agent](../examples/pipeline_multi_agent/) | Pipeline and MsgHub coordination |
 | [goal_pipeline](../examples/goal_pipeline/) | Offline executor/verifier loop that checks and corrects an actual artifact |
+| [team_pipeline](../examples/team_pipeline/) | Offline named-member delegation, host confirmation and member follow-up |
 | [agent_team](../examples/agent_team/) | Leader/worker agent coordination |
 | [mcp](../examples/mcp/) | MCP tool discovery and calls |
 | [mcp_streamable](../examples/mcp_streamable/) | MCP Streamable HTTP client with an in-process spec server |

@@ -87,6 +87,13 @@ ports and deferred work, including realtime/TUI, SOP and model-context wiring.
 
 ## Unreleased execution and retrieval behavior
 
+- `pipeline.TeamPipeline` / `TeamRun` are Experimental. Stage 1 provides serial
+  named-member delegation, validated participant interactions and final text
+  results. Factories own fresh agents per run, with member history retained
+  within that run. Cancellation joins accepted cores before reuse; detached
+  tool work and durable team recovery are outside the contract.
+  See [TeamPipeline](docs/team-pipeline.md).
+
 - `pipeline.GoalPipeline` and its Agent adapters are Experimental. The first
   stage runs bounded, non-interactive executor-verifier checks with a run-local
   goal; it does not add persistent goal storage or HITL resume.

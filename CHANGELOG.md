@@ -11,6 +11,21 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Added — serial named-member teams
+
+- Experimental `pipeline.TeamPipeline` runs named-member assignments serially,
+  retaining member history within a run and routing participant confirmation
+  and external results through a validated host input API. Only the final model
+  round's text returns to the leader; member errors, interruption and iteration
+  exhaustion remain non-success results. Factories create fresh agents per run,
+  and cancellation joins accepted cores before ownership is released.
+  See [the guide](docs/team-pipeline.md) and offline `team_pipeline` example.
+
+### Fixed — JSON repair string preservation
+
+- Preserve commas inside quoted strings when repairing trailing commas in
+  malformed JSON, including schema-guided tool arguments.
+
 ### Added — bounded goal execution
 
 - Experimental `pipeline.GoalPipeline` runs an executor and verifier with
