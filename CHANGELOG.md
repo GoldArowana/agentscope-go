@@ -319,8 +319,15 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
   fallback with failure evidence, a local-only guard that binds regardless of
   policy preference, unknown-outcome attempts that are never auto-retried,
   and crash-window reconciliation on reopen — all exercised by fault tests
-  that map 1:1 to the invariants. Selecting another model endpoint creates
-  no subtask envelope; the API is not Stable-tier.
+  that map 1:1 to the invariants. The package also adds an experimental
+  plain-text, non-streaming `ChatRouter` for actual buffered `UnifiedAgent.Reply`
+  calls with fake device/edge/cloud ChatModels. It freezes call options once,
+  guards every dispatch and result admission with the original epoch/TTL,
+  rejects invalid responses without fallback, and supports only process-local
+  idempotent response replay. An offline example compares fixed tiers with the
+  routed Agent path without claiming live-provider or hardware performance.
+  Selecting another model endpoint creates no subtask envelope; the API is not
+  Stable-tier.
 
 - `mcp/streamablehttp` provides a Streamable HTTP client for MCP (#55, #63),
   backed by the official `modelcontextprotocol/go-sdk` (pinned v1.8.0) — the
