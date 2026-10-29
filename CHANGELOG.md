@@ -11,6 +11,11 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
 
 ## [Unreleased]
 
+### Fixed — JSON repair string preservation
+
+- Preserve commas inside quoted strings when repairing trailing commas in
+  malformed JSON, including schema-guided tool arguments.
+
 ### Added — bounded goal execution
 
 - Experimental `pipeline.GoalPipeline` runs an executor and verifier with

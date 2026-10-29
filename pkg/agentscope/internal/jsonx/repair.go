@@ -8,10 +8,7 @@ import (
 	"strings"
 )
 
-var (
-	fenceRe       = regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)\\s*```")
-	trailingComma = regexp.MustCompile(`,\s*([}\]])`)
-)
+var fenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*\n?(.*?)\\s*```")
 
 // RepairAndUnmarshal tries json.Unmarshal first; on failure it attempts
 // several heuristic repairs (strip markdown fences, extract object/array,
@@ -68,10 +65,44 @@ func applyFixes(s string) string {
 	// single quotes → double quotes (only outside already-doubled strings)
 	s = fixSingleQuotes(s)
 	// trailing commas
-	s = trailingComma.ReplaceAllString(s, "$1")
+	s = removeTrailingCommas(s)
 	// close unclosed brackets
 	s = closeBrackets(s)
 	return s
+}
+
+func removeTrailingCommas(s string) string {
+	var buf strings.Builder
+	inString, escaped := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			buf.WriteByte(c)
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+		} else if c == ',' {
+			j := i + 1
+			// Match the ASCII whitespace accepted by the previous regexp's \s.
+			for j < len(s) && strings.ContainsRune(" \t\n\r\f", rune(s[j])) {
+				j++
+			}
+			if j < len(s) && (s[j] == '}' || s[j] == ']') {
+				i = j - 1
+				continue
+			}
+		}
+		buf.WriteByte(c)
+	}
+	return buf.String()
 }
 
 func extractBrackets(s string, open, close byte) string {
