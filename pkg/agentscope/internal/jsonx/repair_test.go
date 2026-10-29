@@ -1,8 +1,55 @@
 package jsonx
 
 import (
+	"encoding/json"
 	"testing"
 )
+
+func TestRepairAndUnmarshal_PreservesQuotedCommas(t *testing.T) {
+	for _, value := range []string{",}", ",]", ", }", `quote\",}`, `slash\\,]`} {
+		t.Run(value, func(t *testing.T) {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := append([]byte(`{"value":`), encoded...)
+			input = append(input, []byte(`,"nested":[1,],}`)...)
+			var got map[string]any
+			if err := RepairAndUnmarshal(input, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got["value"] != value {
+				t.Fatalf("value = %q, want %q", got["value"], value)
+			}
+		})
+	}
+}
+
+func TestRepairWithSchema_PreservesQuotedCommas(t *testing.T) {
+	var got map[string]any
+	input := []byte(`{'value': ',}', 'count': '2',}`)
+	schema := json.RawMessage(`{"properties":{"count":{"type":"integer"}}}`)
+	if err := RepairWithSchema(input, schema, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["value"] != ",}" || got["count"] != float64(2) {
+		t.Fatalf("unexpected repaired arguments: %#v", got)
+	}
+}
+
+func TestRemoveTrailingCommas_StringBoundaries(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{`{"key,}":"value,]"}`, `{"key,}":"value,]"}`},
+		{`{"value":"quote\",}",}`, `{"value":"quote\",}"}`},
+		{`{"value":"slash\\",}`, `{"value":"slash\\"}`},
+		{"[1, \t\n\r\f]", "[1]"},
+		{"[1,\v]", "[1,\v]"},
+	} {
+		if got := removeTrailingCommas(tc.input); got != tc.want {
+			t.Errorf("removeTrailingCommas(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
 
 func TestRepairAndUnmarshal_ValidJSON(t *testing.T) {
 	var v map[string]any
