@@ -188,6 +188,7 @@ necesarios.
 | [pipeline_multi_agent](examples/pipeline_multi_agent/) | Coordinación con Pipeline y MsgHub |
 | [agent_team](examples/agent_team/) | Coordinación de agentes líder y trabajadores |
 | [goal_pipeline](examples/goal_pipeline/) | Ciclo de ejecución y verificación con modelos simulados y un archivo real |
+| [team_pipeline](examples/team_pipeline/) | Delegación secuencial con confirmación del anfitrión y una consulta de seguimiento |
 | [mcp](examples/mcp/) | Descubrimiento y llamadas a herramientas MCP |
 | [mcp_streamable](examples/mcp_streamable/) | Cliente MCP Streamable HTTP con un servidor spec en proceso |
 | [a2a_http](examples/a2a_http/) | Comunicación entre agentes por HTTP |
