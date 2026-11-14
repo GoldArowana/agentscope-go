@@ -1,0 +1,105 @@
+name: Go PR 153 coverage diagnostic
+
+on:
+  push:
+    branches:
+      - validation/go153-coverage-e5e7606a
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Coverage (${{ matrix.source.name }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        source:
+          - name: base
+            sha: 06d7c4d4bb8a02260525813e4599477a9a56a702
+            tree: 2f7e64faf79d18ac4b53cf13bd2b0ab49fae4e0a
+          - name: head
+            sha: bf5b9037471babf2d96749d325837058a9f28410
+            tree: 75d30984b6737073d06951b96eb91138325a9106
+    env:
+      GOTOOLCHAIN: local
+      SOURCE_SHA: ${{ matrix.source.sha }}
+      SOURCE_TREE: ${{ matrix.source.tree }}
+    steps:
+      - name: Check out the exact public source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: agentscope-ai/agentscope-go
+          ref: ${{ matrix.source.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up the CI Go version
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.25.14'
+          cache: false
+
+      - name: Verify the source and runner
+        working-directory: source
+        env:
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          echo "Harness event SHA: $EVENT_SHA"
+          echo "Source SHA: $(git rev-parse HEAD)"
+          echo "Source tree: $(git rev-parse HEAD^{tree})"
+          echo "Host image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          uname -srvmo
+          cat /etc/os-release
+          go version
+          test "$EVENT_SHA" != "$SOURCE_SHA"
+          test "$(git remote get-url origin)" = https://github.com/agentscope-ai/agentscope-go
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          test "$(uname -m)" = x86_64
+          . /etc/os-release
+          test "$VERSION_ID" = 26.04
+          test "$(go version)" = 'go version go1.25.14 linux/amd64'
+          git diff HEAD --exit-code
+
+      - name: Build, check modules, vet, and run the race tests
+        working-directory: source
+        run: |
+          go build ./...
+          go build ./examples/...
+          go mod tidy
+          git diff HEAD --exit-code
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Run all-package coverage with stdout visible
+        working-directory: source
+        run: |
+          coverage_exit=0
+          go test -coverprofile=coverage.out ./... || coverage_exit=$?
+          echo "All-package coverage test exit: $coverage_exit"
+          if [ "$coverage_exit" -ne 0 ]; then
+            exit "$coverage_exit"
+          fi
+          printf 'Total ./...: '
+          go tool cover -func=coverage.out | tail -1
+
+      - name: Apply the upstream library coverage threshold
+        working-directory: source
+        env:
+          COVERAGE_MIN: '68.6'
+        run: |
+          go test -coverprofile=coverage-pkg.out ./pkg/...
+          total=$(go tool cover -func=coverage-pkg.out | tail -1 | awk '{print $NF}' | tr -d '%')
+          echo "Total ./pkg/...: ${total}% (floor ${COVERAGE_MIN}%)"
+          awk -v t="$total" -v min="$COVERAGE_MIN" 'BEGIN { if (t+0 < min+0) exit 1 }'
+
+      - name: Verify tracked source after diagnostic
+        if: always()
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$SOURCE_TREE"
+          git diff HEAD --exit-code
