@@ -1,0 +1,114 @@
+name: Validate Gemini reply history for issue 208
+
+on:
+  push:
+    branches: [validation/gemini-208-dcc7283a]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Go 1.25 source and regression checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 22
+    steps:
+      - name: Check out validation files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: receipt
+      - name: Check out upstream source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: agentscope-ai/agentscope-go
+          ref: b70a486c4c003b62475ad23f7fc4d0b196512c80
+          persist-credentials: false
+          path: source
+      - name: Verify source and apply reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = GoldArowana/agentscope-go
+          test "$GITHUB_REF_NAME" = validation/gemini-208-dcc7283a
+          test "$(git -C receipt rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C source remote get-url origin)" = https://github.com/agentscope-ai/agentscope-go
+          test "$(git -C source rev-parse HEAD)" = b70a486c4c003b62475ad23f7fc4d0b196512c80
+          test "$(git -C source rev-parse 'HEAD^{tree}')" = 2f810e487a24fa7c5153c3041dee77486c0e2426
+          test -z "$(git -C source status --porcelain=v1 -uall)"
+          patch="$GITHUB_WORKSPACE/receipt/validation/gemini-208.patch"
+          printf '%s  %s\n' 173cda80bc5eada18c0a7dfc57f61ddec8a264a7b4562e4d159652d3b0a70581 "$patch" | sha256sum --check --strict
+          git -C source apply --index "$patch"
+          test "$(git -C source write-tree)" = d031a6f961d214677d4565cb0661b86c08c0f7c9
+          git -C source diff --cached --check
+          printf 'verification_event_commit=%s source_base=%s source_candidate_tree=%s\n' "$GITHUB_SHA" "$(git -C source rev-parse HEAD)" "$(git -C source write-tree)"
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version: '1.25.14'
+          cache: false
+      - name: Install CI-pinned linter
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/golangci-lint-2.14.0-linux-amd64.tar.gz"
+          curl --fail --silent --show-error --location --connect-timeout 15 --max-time 120 -o "$archive" https://github.com/golangci/golangci-lint/releases/download/v2.14.0/golangci-lint-2.14.0-linux-amd64.tar.gz
+          printf '%s  %s\n' ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/golangci-lint-2.14.0-linux-amd64/golangci-lint" version
+      - name: Run standard checks and touched-package comparison
+        shell: bash
+        working-directory: source
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          set -u -o pipefail
+          go version
+          go version | grep -F 'go1.25.14 linux/amd64' || exit 2
+          overall=0
+          run_check() {
+            local name=$1
+            shift
+            printf 'start_check=%s\n' "$name"
+            "$@"
+            local code=$?
+            printf 'end_check=%s exit=%s\n' "$name" "$code"
+            if test "$code" != 0; then
+              overall=1
+            fi
+          }
+          run_check build go build ./...
+          run_check examples go build ./examples/...
+          run_check tidy go mod tidy -diff
+          run_check vet go vet ./...
+          run_check race go test -race -count=1 ./...
+          run_check tests go test -count=1 ./...
+          run_check lint "$RUNNER_TEMP/golangci-lint-2.14.0-linux-amd64/golangci-lint" run ./...
+          run_check coverage make cover-check
+          stock="$RUNNER_TEMP/source-stock"
+          git worktree add --detach "$stock" b70a486c4c003b62475ad23f7fc4d0b196512c80 || exit 2
+          test "$(git -C "$stock" rev-parse 'HEAD^{tree}')" = 2f810e487a24fa7c5153c3041dee77486c0e2426 || exit 2
+          test -z "$(git -C "$stock" status --porcelain=v1 -uall)" || exit 2
+          (cd "$stock" && go test -count=1 -cover ./pkg/agentscope/model ./pkg/agentscope/agent > "$RUNNER_TEMP/base-coverage.txt" 2>&1)
+          base_code=$?
+          printf 'end_check=base_touched_coverage exit=%s\n' "$base_code"
+          cat "$RUNNER_TEMP/base-coverage.txt"
+          go test -count=1 -cover ./pkg/agentscope/model ./pkg/agentscope/agent > "$RUNNER_TEMP/candidate-coverage.txt" 2>&1
+          candidate_code=$?
+          printf 'end_check=candidate_touched_coverage exit=%s\n' "$candidate_code"
+          cat "$RUNNER_TEMP/candidate-coverage.txt"
+          test "$base_code" = 0 && test "$candidate_code" = 0 || overall=1
+          git -C "$stock" diff HEAD --exit-code || overall=1
+          test -z "$(git -C "$stock" status --porcelain=v1 -uall)" || overall=1
+          exit "$overall"
+      - name: Confirm exact final source tree
+        if: always()
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = b70a486c4c003b62475ad23f7fc4d0b196512c80
+          test "$(git write-tree)" = d031a6f961d214677d4565cb0661b86c08c0f7c9
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+          printf 'source_validation_final_tree=%s worktree_clean_against_index=true\n' "$(git write-tree)"

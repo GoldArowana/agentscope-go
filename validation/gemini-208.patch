@@ -1,0 +1,582 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fbdb6cf..93a066f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,11 @@ releases can be verified with `git log <prev-tag>..<tag> --oneline`.
+ 
+ ## [Unreleased]
+ 
++### Fixed — Gemini tool history
++
++- Buffered and streamed Gemini requests preserve the text, tool calls, and
++  tool-call thought signatures in agent replies that contain tool results (#208).
++
+ ### Added — Jev model selection
+ 
+ - Jev supports an explicit model override for ordinary classification without
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 50e34ba..c54c366 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -261,9 +261,11 @@ into assistant/user segments and groups consecutive tool results without adding
+ sender text before them. The stored history remains unchanged. Buffered and
+ streamed parsing retain redacted thinking data, and formatting retains empty
+ thinking with a nonempty signature for tool-history continuation. Gemini builds
+-requests separately
+-in `model/gemini.go`: formatter support for media inside hints does not establish
+-adapter support. Both paths filter empty text before joining or emitting it;
++requests separately in `model/gemini.go`. The adapter projects each stored
++message into ordered segments, grouping neighboring tool results as user
++content while keeping each call and its signature in model content. Formatter
++support for media inside hints does not establish adapter support. Both paths
++filter empty text before joining or emitting it;
+ nonempty whitespace remains content. Multi-agent formatting must associate each
+ output with its original sender before filtering messages.
+ 
+diff --git a/docs/model-providers.md b/docs/model-providers.md
+index 299d089..f7df313 100644
+--- a/docs/model-providers.md
++++ b/docs/model-providers.md
+@@ -257,7 +257,11 @@ cm, _ := model.NewGeminiChatModel(model.GeminiConfig{
+ Models: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3-flash-preview`, `gemini-3.1-pro-preview`
+ 
+ Gemini preserves provider-issued tool-call IDs and replays the same ID on
+-`functionCall` and `functionResponse`; absent IDs use the existing generated ID.
++`functionCall` and `functionResponse`. When the provider omits the ID, the adapter
++generates one. For a stored reply with text, calls, and results, the adapter sends
++model text and calls in order, then sends consecutive results as user content.
++Later model text starts a new model entry. Any call's thought signature stays on
++its original call part. This projection leaves the stored reply intact.
+ The adapter targets the Gemini Developer API. Custom `BaseURL` endpoints must
+ accept these ID fields; Vertex-style endpoint compatibility is not guaranteed.
+ 
+diff --git a/pkg/agentscope/agent/gemini_tool_history_test.go b/pkg/agentscope/agent/gemini_tool_history_test.go
+new file mode 100644
+index 0000000..90701bc
+--- /dev/null
++++ b/pkg/agentscope/agent/gemini_tool_history_test.go
+@@ -0,0 +1,183 @@
++package agent
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
++	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/model"
++	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/tool"
++)
++
++type geminiHistoryRequest struct {
++	Contents []struct {
++		Role  string `json:"role"`
++		Parts []struct {
++			Text         string `json:"text"`
++			Signature    string `json:"thoughtSignature"`
++			FunctionCall *struct {
++				ID   string            `json:"id"`
++				Name string            `json:"name"`
++				Args map[string]string `json:"args"`
++			} `json:"functionCall"`
++			FunctionResponse *struct {
++				ID       string `json:"id"`
++				Name     string `json:"name"`
++				Response struct {
++					Result string `json:"result"`
++				} `json:"response"`
++			} `json:"functionResponse"`
++		} `json:"parts"`
++	} `json:"contents"`
++}
++
++func (request geminiHistoryRequest) describe() []string {
++	segments := make([]string, 0, len(request.Contents))
++	for _, content := range request.Contents {
++		var parts []string
++		for _, part := range content.Parts {
++			switch {
++			case part.FunctionCall != nil:
++				call := part.FunctionCall
++				parts = append(parts, fmt.Sprintf("call %s %s %s %s", call.ID, call.Name, call.Args["value"], part.Signature))
++			case part.FunctionResponse != nil:
++				result := part.FunctionResponse
++				parts = append(parts, fmt.Sprintf("result %s %s %s", result.ID, result.Name, result.Response.Result))
++			default:
++				parts = append(parts, part.Text)
++			}
++		}
++		segments = append(segments, content.Role+":"+strings.Join(parts, "|"))
++	}
++	return segments
++}
++
++func TestUnifiedAgentGeminiToolHistory(t *testing.T) {
++	const signature = "c2lnLXNlbnRpbmVs"
++	// The fixture returns an ordinary parallel step, a second tool step in
++	// the same reply, and then a handoff that ends the next reply at its result.
++	responseParts := []string{
++		`{"text":"first step"},{"functionCall":{"id":"a","name":"lookup","args":{"value":"x"}},"thoughtSignature":"` + signature + `"},{"functionCall":{"id":"b","name":"lookup","args":{"value":"y"}}}`,
++		`{"text":"second step"},{"functionCall":{"id":"c","name":"lookup","args":{"value":"z"}}}`,
++		`{"text":"first answer"}`,
++		`{"text":"handing off"},{"functionCall":{"id":"d","name":"transfer","args":{}}}`,
++		`{"text":"follow-up answer"}`,
++	}
++	firstHistory := []string{
++		"user:begin",
++		"model:first step|call a lookup x " + signature + "|call b lookup y ",
++		"user:result a lookup x|result b lookup y",
++	}
++	completedHistory := append(append([]string{}, firstHistory...),
++		"model:second step|call c lookup z ", "user:result c lookup z", "model:first answer", "user:handoff",
++	)
++	expected := [][]string{
++		{"user:begin"},
++		firstHistory,
++		completedHistory[:5],
++		completedHistory,
++		append(append([]string{}, completedHistory...), "model:handing off|call d transfer  ", "user:result d transfer transferred", "user:follow up"),
++	}
++
++	for _, streaming := range []bool{false, true} {
++		mode := "buffered"
++		if streaming {
++			mode = "streaming"
++		}
++		t.Run(mode, func(t *testing.T) {
++			var requestCount, executions atomic.Int32
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				index := int(requestCount.Add(1)) - 1
++				if index >= len(responseParts) {
++					http.Error(w, "unexpected additional request", http.StatusBadRequest)
++					return
++				}
++				var request geminiHistoryRequest
++				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
++					t.Error(err)
++					http.Error(w, "decode", http.StatusBadRequest)
++					return
++				}
++				if got, want := request.describe(), expected[index]; !reflect.DeepEqual(got, want) {
++					t.Errorf("request %d contents:\n got %q\nwant %q", index+1, got, want)
++				}
++				body := fmt.Sprintf(`{"candidates":[{"content":{"role":"model","parts":[%s]},"finishReason":"STOP"}]}`, responseParts[index])
++				if streaming {
++					w.Header().Set("Content-Type", "text/event-stream")
++					fmt.Fprintf(w, "data: %s\n\n", body)
++					return
++				}
++				fmt.Fprint(w, body)
++			}))
++			defer server.Close()
++
++			adapter, err := model.NewGeminiChatModel(model.GeminiConfig{
++				APIKey: "test-only", Model: "test", BaseURL: server.URL, HTTPClient: server.Client(),
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			lookup := tool.NewFunctionTool("lookup", "Look up a fixture value", nil, func(_ context.Context, args map[string]any) (any, error) {
++				executions.Add(1)
++				return args["value"], nil
++			})
++			var agent *UnifiedAgent
++			transfer := tool.NewFunctionTool("transfer", "End this fixture reply", nil, func(context.Context, map[string]any) (any, error) {
++				executions.Add(1)
++				agent.MarkHandedOff()
++				return "transferred", nil
++			})
++			agent = NewUnifiedAgent("fixture", "Use fixture tools.", adapter,
++				WithToolkit(tool.NewToolkit(lookup, transfer)), WithModelStreaming(streaming))
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++
++			firstReply, err := agent.Reply(ctx, "begin")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if len(firstReply.GetContentBlocks(message.ContentBlockToolResult)) != 3 {
++				t.Fatalf("first reply lost tool results: %v", firstReply.Content)
++			}
++			handoffReply, err := agent.Reply(ctx, "handoff")
++			if err != nil {
++				t.Fatal(err)
++			}
++			parts := handoffReply.GetContentBlocks()
++			if len(parts) == 0 || parts[len(parts)-1].GetType() != message.ContentBlockToolResult {
++				t.Fatalf("handoff reply did not end with a tool result: %v", parts)
++			}
++			saved := len(agent.state.Context)
++			before, err := json.Marshal(agent.state.Context)
++			if err != nil {
++				t.Fatal(err)
++			}
++			finalReply, err := agent.Reply(ctx, "follow up")
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := finalReply.GetTextContent(""); got == nil || *got != "follow-up answer" {
++				t.Fatalf("unexpected final reply: %v", finalReply.Content)
++			}
++			after, err := json.Marshal(agent.state.Context[:saved])
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !bytes.Equal(before, after) {
++				t.Fatal("request replay mutated stored conversation history")
++			}
++			if requestCount.Load() != int32(len(expected)) || executions.Load() != 4 {
++				t.Fatalf("requests=%d executions=%d", requestCount.Load(), executions.Load())
++			}
++		})
++	}
++}
+diff --git a/pkg/agentscope/model/gemini.go b/pkg/agentscope/model/gemini.go
+index e1c5f3f..ca0278d 100644
+--- a/pkg/agentscope/model/gemini.go
++++ b/pkg/agentscope/model/gemini.go
+@@ -167,68 +167,7 @@ func (m *GeminiChatModel) buildRequest(msgs []*message.Msg, callOpts *CallOption
+ 			continue
+ 		}
+ 
+-		geminiRole := "user"
+-		if role == "assistant" {
+-			geminiRole = "model"
+-		}
+-
+-		var parts []geminiPart
+-
+-		// Tool results
+-		toolResults := msg.GetContentBlocks(message.ContentBlockToolResult)
+-		if len(toolResults) > 0 {
+-			for _, tr := range toolResults {
+-				trb := tr.(message.ToolResultBlock)
+-				responseKey := "result"
+-				if trb.State == message.ToolResultError {
+-					responseKey = "error"
+-				}
+-				parts = append(parts, geminiPart{
+-					FunctionResponse: &geminiFunctionResponse{
+-						ID:   trb.ID,
+-						Name: trb.Name,
+-						Response: map[string]any{
+-							responseKey: formatter.ConvertToolResultToString(trb.Output),
+-						},
+-					},
+-				})
+-			}
+-			contents = append(contents, geminiContent{Role: "user", Parts: parts})
+-			continue
+-		}
+-
+-		// Tool calls
+-		toolCalls := msg.GetContentBlocks(message.ContentBlockToolCall)
+-		if len(toolCalls) > 0 {
+-			for _, tc := range toolCalls {
+-				tcb := tc.(message.ToolCallBlock)
+-				var args map[string]any
+-				_ = json.Unmarshal([]byte(tcb.Input), &args)
+-				part := geminiPart{
+-					FunctionCall: &geminiFunctionCall{
+-						ID:   tcb.ID,
+-						Name: tcb.Name,
+-						Args: args,
+-					},
+-				}
+-				// Echo the signature Gemini attached to this call (upstream #2463).
+-				if sig, ok := tcb.Extra["thought_signature"].(string); ok && sig != "" {
+-					part.ThoughtSignature = sig
+-				}
+-				parts = append(parts, part)
+-			}
+-			contents = append(contents, geminiContent{Role: "model", Parts: parts})
+-			continue
+-		}
+-
+-		// Text content
+-		if txt := geminiTextContent(msg); txt != "" {
+-			parts = append(parts, geminiPart{Text: txt})
+-		}
+-
+-		if len(parts) > 0 {
+-			contents = append(contents, geminiContent{Role: geminiRole, Parts: parts})
+-		}
++		contents = appendGeminiMessage(contents, msg)
+ 	}
+ 
+ 	req := geminiRequest{
+@@ -273,6 +212,72 @@ func (m *GeminiChatModel) buildRequest(msgs []*message.Msg, callOpts *CallOption
+ 	return req, nil
+ }
+ 
++// appendGeminiMessage renders a stored message without changing its blocks.
++func appendGeminiMessage(contents []geminiContent, msg *message.Msg) []geminiContent {
++	textRole := "user"
++	if msg.Role == message.RoleAssistant {
++		textRole = "model"
++	}
++	// Only group parts within this message. A user-role result segment must
++	// also remain separate from any ordinary user text next to it.
++	segmentStart := len(contents)
++	previousIsResult := false
++	appendPart := func(role string, isResult bool, part geminiPart) {
++		if len(contents) == segmentStart || contents[len(contents)-1].Role != role || previousIsResult != isResult {
++			contents = append(contents, geminiContent{Role: role})
++		}
++		current := &contents[len(contents)-1]
++		current.Parts = append(current.Parts, part)
++		previousIsResult = isResult
++	}
++
++	var texts []string
++	flushText := func() {
++		if len(texts) > 0 {
++			appendPart(textRole, false, geminiPart{Text: strings.Join(texts, "\n")})
++			texts = texts[:0]
++		}
++	}
++	for _, block := range msg.Content {
++		switch value := block.(type) {
++		case message.TextBlock:
++			if value.Text != "" {
++				texts = append(texts, value.Text)
++			}
++		case message.ToolCallBlock:
++			flushText()
++			var args map[string]any
++			_ = json.Unmarshal([]byte(value.Input), &args)
++			signature, _ := value.Extra["thought_signature"].(string)
++			appendPart("model", false, geminiPart{
++				FunctionCall: &geminiFunctionCall{
++					ID:   value.ID,
++					Name: value.Name,
++					Args: args,
++				},
++				ThoughtSignature: signature,
++			})
++		case message.ToolResultBlock:
++			flushText()
++			responseKey := "result"
++			if value.State == message.ToolResultError {
++				responseKey = "error"
++			}
++			appendPart("user", true, geminiPart{
++				FunctionResponse: &geminiFunctionResponse{
++					ID:   value.ID,
++					Name: value.Name,
++					Response: map[string]any{
++						responseKey: formatter.ConvertToolResultToString(value.Output),
++					},
++				},
++			})
++		}
++	}
++	flushText()
++	return contents
++}
++
+ // isGeminiLevelModel mirrors Python AgentScope at 3fef100e. Keep the gate
+ // exact: unknown model IDs retain the budget-era contract.
+ func isGeminiLevelModel(name string) bool {
+diff --git a/pkg/agentscope/model/gemini_mixed_history_test.go b/pkg/agentscope/model/gemini_mixed_history_test.go
+new file mode 100644
+index 0000000..3b1e8a8
+--- /dev/null
++++ b/pkg/agentscope/model/gemini_mixed_history_test.go
+@@ -0,0 +1,188 @@
++package model
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/message"
++)
++
++func TestGeminiMixedHistoryHTTP(t *testing.T) {
++	text := func(s string) message.TextBlock { return message.TextBlock{Type: "text", Text: s} }
++	call := func(id string) message.ToolCallBlock {
++		return message.ToolCallBlock{
++			Type: "tool_call", ID: id, Name: "lookup", Input: "{}",
++			Extra: map[string]any{"thought_signature": "sig-" + id},
++		}
++	}
++	result := func(id string, state message.ToolResultState) message.ToolResultBlock {
++		return message.ToolResultBlock{
++			Type: "tool_result", ID: id, Name: "lookup", Output: "fixture", State: state,
++		}
++	}
++	asst := func(blocks ...message.ContentBlock) *message.Msg {
++		return &message.Msg{Role: message.RoleAssistant, Content: blocks}
++	}
++	success := message.ToolResultSuccess
++	lineup := []struct {
++		name    string
++		history []*message.Msg
++		want    string
++	}{
++		{
++			name:    "separate-messages",
++			history: []*message.Msg{asst(text("before")), asst(call("a")), asst(result("a", success)), asst(text("after"))},
++			want:    "model{text:before};model{call:a:sig-a};user{result:a:fixture};model{text:after}",
++		},
++		{
++			name:    "plain-text",
++			history: []*message.Msg{{Role: message.RoleUser, Content: []message.ContentBlock{text("ordinary query")}}},
++			want:    "user{text:ordinary query}",
++		},
++		{
++			name:    "failed-tool-result",
++			history: []*message.Msg{asst(call("a")), asst(result("a", message.ToolResultError))},
++			want:    "model{call:a:sig-a};user{error:a:fixture}",
++		},
++		{
++			name:    "mixed-completed-reply",
++			history: []*message.Msg{asst(text("before"), call("a"), result("a", success), text("after"))},
++			want:    "model{text:before,call:a:sig-a};user{result:a:fixture};model{text:after}",
++		},
++		{
++			name:    "pending-parallel-sibling",
++			history: []*message.Msg{asst(text("before"), call("a"), call("b"), result("a", success))},
++			want:    "model{text:before,call:a:sig-a,call:b:sig-b};user{result:a:fixture}",
++		},
++		{
++			name:    "call-with-text-before-result",
++			history: []*message.Msg{asst(text("before"), call("a"))},
++			want:    "model{text:before,call:a:sig-a}",
++		},
++		{
++			name: "parallel-completion-order",
++			history: []*message.Msg{asst(call("a"), call("b"), result("b", success),
++				message.ThinkingBlock{Type: "thinking", Thinking: "ignored"}, result("a", message.ToolResultError))},
++			want: "model{call:a:sig-a,call:b:sig-b};user{result:b:fixture,error:a:fixture}",
++		},
++		{
++			name: "sequential-tool-steps",
++			history: []*message.Msg{asst(call("a"), result("a", success), text("next"), call("b"),
++				result("b", success)), message.UserMsg("u", "follow up")},
++			want: "model{call:a:sig-a};user{result:a:fixture};model{text:next,call:b:sig-b};user{result:b:fixture};user{text:follow up}",
++		},
++		{
++			name: "plain-text-blocks",
++			history: []*message.Msg{nil, asst(text("first"), text(""),
++				message.ThinkingBlock{Type: "thinking", Thinking: "ignored"}, text(" "), text("last")), asst(text(""))},
++			want: "model{text:first\n \nlast}",
++		},
++	}
++	for _, stream := range []bool{false, true} {
++		transport := "buffered"
++		if stream {
++			transport = "stream"
++		}
++		for _, tt := range lineup {
++			t.Run(transport+"/"+tt.name, func(t *testing.T) {
++				before, err := json.Marshal(tt.history)
++				if err != nil {
++					t.Fatal(err)
++				}
++				requestBodies := make(chan geminiRequest, 1)
++				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					var request geminiRequest
++					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
++						t.Error(err)
++						http.Error(w, "decode", http.StatusBadRequest)
++						return
++					}
++					select {
++					case requestBodies <- request:
++					default:
++						t.Error("received an unexpected additional request")
++					}
++					const response = `{"candidates":[{"content":{"role":"model","parts":[{"text":"fixture"}]},"finishReason":"STOP"}]}`
++					if stream {
++						w.Header().Set("Content-Type", "text/event-stream")
++						fmt.Fprintf(w, "data: %s\n\n", response)
++						return
++					}
++					fmt.Fprint(w, response)
++				}))
++				defer server.Close()
++				adapter, err := NewGeminiChatModel(GeminiConfig{
++					APIKey: "test-only", Model: "fixture", BaseURL: server.URL, HTTPClient: server.Client(),
++				})
++				if err != nil {
++					t.Fatal(err)
++				}
++				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++				defer cancel()
++				if stream {
++					responses, err := adapter.ChatStream(ctx, tt.history)
++					if err != nil {
++						t.Fatal(err)
++					}
++					final := false
++					for response := range responses {
++						if response.Error != nil {
++							t.Fatal(response.Error)
++						}
++						final = final || response.IsLast
++					}
++					if !final {
++						t.Fatal("missing final stream response")
++					}
++				} else if _, err := adapter.Chat(ctx, tt.history); err != nil {
++					t.Fatal(err)
++				}
++				after, err := json.Marshal(tt.history)
++				if err != nil {
++					t.Fatal(err)
++				}
++				if !bytes.Equal(before, after) {
++					t.Error("request mutated stored message blocks")
++				}
++				select {
++				case request := <-requestBodies:
++					if got := summarizeGeminiContents(request.Contents); got != tt.want {
++						t.Errorf("ordered contents got %q; want %q", got, tt.want)
++					}
++				default:
++					t.Fatal("missing local HTTP request")
++				}
++			})
++		}
++	}
++}
++
++func summarizeGeminiContents(contents []geminiContent) string {
++	var entries []string
++	for _, entry := range contents {
++		var parts []string
++		for _, part := range entry.Parts {
++			switch {
++			case part.FunctionCall != nil:
++				parts = append(parts, "call:"+part.FunctionCall.ID+":"+part.ThoughtSignature)
++			case part.FunctionResponse != nil:
++				for _, key := range []string{"result", "error"} {
++					if value, ok := part.FunctionResponse.Response[key]; ok {
++						parts = append(parts, fmt.Sprintf("%s:%s:%v", key, part.FunctionResponse.ID, value))
++					}
++				}
++			default:
++				parts = append(parts, "text:"+part.Text)
++			}
++		}
++		entries = append(entries, entry.Role+"{"+strings.Join(parts, ",")+"}")
++	}
++	return strings.Join(entries, ";")
++}
