@@ -1,0 +1,69 @@
+name: ForkSession baseline regression
+
+on:
+  push:
+    branches: [ci/agentscope-go-fork-baseline-20261127]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    if: github.repository == 'GoldArowana/agentscope-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify unchanged production at the exact base
+        run: |
+          test "$(git rev-parse HEAD^)" = 12f8eebddf9aa370f2904cc1b8835aeae968df67
+          test "$(git rev-parse HEAD:pkg/agentscope/agent/checkpoint.go)" = d192f403c59c857d1cbf5cf5bfd4e09c9239c7cb
+          diff -u             <(printf '%s\n' .github/workflows/forksession-baseline-once.yml pkg/agentscope/agent/fork_session_test.go)             <(git diff --name-only HEAD^ HEAD | sort)
+      - name: Reproduce both checkpoint failures and check controls
+        run: |
+          log="$RUNNER_TEMP/forksession-base.jsonl"
+          set +e
+          go test -mod=readonly -count=1 -json ./pkg/agentscope/agent -run '^(TestForkSession_RejectsSourceSessionID|TestForkSession_RoundTrip|TestForkSession_Errors)$' 2>&1 | tee "$log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          test "$test_status" = 1
+          python3 - "$log" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          tests = {
+              'TestForkSession_RejectsSourceSessionID': 'fail',
+              'TestForkSession_RoundTrip': 'pass',
+              'TestForkSession_Errors': 'pass',
+          }
+          target = 'TestForkSession_RejectsSourceSessionID'
+          package = 'github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/agent'
+          events = []
+          for line in Path(sys.argv[1]).read_text().splitlines():
+              if line.startswith('{'):
+                  events.append(json.loads(line))
+          decisions = {
+              event['Test']: event['Action']
+              for event in events
+              if event.get('Package') == package
+              and event.get('Test')
+              and event['Action'] in ('pass', 'fail')
+          }
+          assert decisions == tests, decisions
+          outputs = [
+              event['Output'].strip()
+              for event in events
+              if event.get('Test') == target and event['Action'] == 'output'
+          ]
+          assert any(line.endswith('forking onto the source session should return an error') for line in outputs), outputs
+          assert any(line.endswith('source checkpoint reply ID = "", want "reply-saved"') for line in outputs), outputs
+          print('EXPECTED_BASELINE_FAILURE: source checkpoint was overwritten and same-ID fork returned nil; both controls passed')
+          PY
