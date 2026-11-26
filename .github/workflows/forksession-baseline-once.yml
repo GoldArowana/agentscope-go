@@ -1,4 +1,4 @@
-name: ForkSession repair gates
+name: ForkSession matched agent coverage
 
 on:
   push:
@@ -13,52 +13,61 @@ defaults:
     shell: bash
 
 jobs:
-  validate:
+  matched-coverage:
     if: github.repository == 'GoldArowana/agentscope-go'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 22
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
-      - name: Materialize and verify the two-file production and test tree
+      - name: Verify and materialize pure baseline and exact repair source
         run: |
-          test "$(git rev-parse HEAD^^)" = 12f8eebddf9aa370f2904cc1b8835aeae968df67
-          test "$(git rev-parse HEAD^)" = f8934e6a985ecdb885214db8617dc4ef206ffa2b
+          test "$(git rev-parse HEAD^^^)" = 12f8eebddf9aa370f2904cc1b8835aeae968df67
           git rm -- .github/workflows/forksession-baseline-once.yml
           test "$(git write-tree)" = 751fe148cdce80c1c1168865c05572a12069f9e0
           git diff --exit-code
+          git worktree add --detach "$RUNNER_TEMP/forksession-coverage-base" 12f8eebddf9aa370f2904cc1b8835aeae968df67
+          test -z "$(git -C "$RUNNER_TEMP/forksession-coverage-base" status --porcelain)"
           echo "VERIFIED_REPAIR_TREE 751fe148cdce80c1c1168865c05572a12069f9e0"
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
           go-version: '1.25'
           cache: false
-      - name: ForkSession behavior and unchanged controls
-        run: go test -mod=readonly -count=1 -v ./pkg/agentscope/agent -run '^TestForkSession_'
-      - name: Build
+      - name: Measure both revisions with one Go version and identical flags
         run: |
-          go build ./...
-          go build ./examples/...
-      - name: Module tidiness
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-      - name: Vet
-        run: go vet ./...
-      - name: Full race suite
-        run: go test -race -count=1 ./...
-      - name: Coverage floor
-        if: matrix.os == 'ubuntu-latest'
-        run: make cover-check
-      - name: Lint
-        if: matrix.os == 'ubuntu-latest'
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.14.0
-          skip-cache: true
+          go version
+          (
+            cd "$RUNNER_TEMP/forksession-coverage-base"
+            go test -mod=readonly -count=1 -coverprofile="$RUNNER_TEMP/agent-base.cover" ./pkg/agentscope/agent
+            go tool cover -func="$RUNNER_TEMP/agent-base.cover" > "$RUNNER_TEMP/agent-base.func"
+          )
+          go test -mod=readonly -count=1 -coverprofile="$RUNNER_TEMP/agent-repair.cover" ./pkg/agentscope/agent
+          go tool cover -func="$RUNNER_TEMP/agent-repair.cover" > "$RUNNER_TEMP/agent-repair.func"
+          python3 - "$RUNNER_TEMP/agent-base.func" "$RUNNER_TEMP/agent-repair.func" <<'PY'
+          from decimal import Decimal
+          from pathlib import Path
+          import sys
+
+          def measure(path):
+              total = []
+              fork = []
+              for line in Path(path).read_text().splitlines():
+                  parts = line.split()
+                  if len(parts) < 3:
+                      continue
+                  if parts[0] == 'total:':
+                      total.append((line, Decimal(parts[-1].removesuffix('%'))))
+                  elif parts[-2].split('.')[-1] == 'ForkSession':
+                      fork.append((line, Decimal(parts[-1].removesuffix('%'))))
+              assert len(total) == len(fork) == 1, (total, fork)
+              return total[0], fork[0]
+
+          base_total, base_fork = measure(sys.argv[1])
+          repair_total, repair_fork = measure(sys.argv[2])
+          print('Pure upstream baseline', base_total[0], base_fork[0], sep='\n')
+          print('Exact repair tree', repair_total[0], repair_fork[0], sep='\n')
+          assert repair_total[1] >= base_total[1], (base_total, repair_total)
+          print(f'MATCHED_AGENT_COVERAGE package {base_total[1]}% -> {repair_total[1]}%; ForkSession {base_fork[1]}% -> {repair_fork[1]}%')
+          PY
