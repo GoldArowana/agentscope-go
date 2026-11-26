@@ -1,69 +1,64 @@
-name: ForkSession baseline regression
+name: ForkSession repair gates
 
 on:
   push:
     branches: [ci/agentscope-go-fork-baseline-20261127]
+    paths: [.github/workflows/forksession-baseline-once.yml]
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  baseline:
+  validate:
     if: github.repository == 'GoldArowana/agentscope-go'
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
+      - name: Materialize and verify the two-file production and test tree
+        run: |
+          test "$(git rev-parse HEAD^^)" = 12f8eebddf9aa370f2904cc1b8835aeae968df67
+          test "$(git rev-parse HEAD^)" = f8934e6a985ecdb885214db8617dc4ef206ffa2b
+          git rm -- .github/workflows/forksession-baseline-once.yml
+          test "$(git write-tree)" = 751fe148cdce80c1c1168865c05572a12069f9e0
+          git diff --exit-code
+          echo "VERIFIED_REPAIR_TREE 751fe148cdce80c1c1168865c05572a12069f9e0"
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
         with:
-          go-version-file: go.mod
+          go-version: '1.25'
           cache: false
-      - name: Verify unchanged production at the exact base
+      - name: ForkSession behavior and unchanged controls
+        run: go test -mod=readonly -count=1 -v ./pkg/agentscope/agent -run '^TestForkSession_'
+      - name: Build
         run: |
-          test "$(git rev-parse HEAD^)" = 12f8eebddf9aa370f2904cc1b8835aeae968df67
-          test "$(git rev-parse HEAD:pkg/agentscope/agent/checkpoint.go)" = d192f403c59c857d1cbf5cf5bfd4e09c9239c7cb
-          diff -u             <(printf '%s\n' .github/workflows/forksession-baseline-once.yml pkg/agentscope/agent/fork_session_test.go)             <(git diff --name-only HEAD^ HEAD | sort)
-      - name: Reproduce both checkpoint failures and check controls
+          go build ./...
+          go build ./examples/...
+      - name: Module tidiness
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          log="$RUNNER_TEMP/forksession-base.jsonl"
-          set +e
-          go test -mod=readonly -count=1 -json ./pkg/agentscope/agent -run '^(TestForkSession_RejectsSourceSessionID|TestForkSession_RoundTrip|TestForkSession_Errors)$' 2>&1 | tee "$log"
-          test_status=${PIPESTATUS[0]}
-          set -e
-          test "$test_status" = 1
-          python3 - "$log" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          tests = {
-              'TestForkSession_RejectsSourceSessionID': 'fail',
-              'TestForkSession_RoundTrip': 'pass',
-              'TestForkSession_Errors': 'pass',
-          }
-          target = 'TestForkSession_RejectsSourceSessionID'
-          package = 'github.com/agentscope-ai/agentscope-go/v2/pkg/agentscope/agent'
-          events = []
-          for line in Path(sys.argv[1]).read_text().splitlines():
-              if line.startswith('{'):
-                  events.append(json.loads(line))
-          decisions = {
-              event['Test']: event['Action']
-              for event in events
-              if event.get('Package') == package
-              and event.get('Test')
-              and event['Action'] in ('pass', 'fail')
-          }
-          assert decisions == tests, decisions
-          outputs = [
-              event['Output'].strip()
-              for event in events
-              if event.get('Test') == target and event['Action'] == 'output'
-          ]
-          assert any(line.endswith('forking onto the source session should return an error') for line in outputs), outputs
-          assert any(line.endswith('source checkpoint reply ID = "", want "reply-saved"') for line in outputs), outputs
-          print('EXPECTED_BASELINE_FAILURE: source checkpoint was overwritten and same-ID fork returned nil; both controls passed')
-          PY
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Full race suite
+        run: go test -race -count=1 ./...
+      - name: Coverage floor
+        if: matrix.os == 'ubuntu-latest'
+        run: make cover-check
+      - name: Lint
+        if: matrix.os == 'ubuntu-latest'
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+          skip-cache: true
